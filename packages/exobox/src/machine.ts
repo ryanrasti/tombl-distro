@@ -126,6 +126,8 @@ export interface JspiMachineOptions {
 }
 
 export interface JspiMachine extends Machine {
+  /** Prints every task's state on the console (the kernel's show_state; debugging a hang). */
+  debugTasks(): void;
   /** Settles with why the kernel ended the machine (a panic too: init exiting is one). */
   readonly terminated: Promise<MachineTerminationReason>;
 }
@@ -157,6 +159,8 @@ interface Task {
   ptr?: number;
   started: boolean;
   wake?: () => void;
+  /** why the kernel is about to trap out of its coroutine: it exited, or it execs (user_restart) */
+  leaving?: "exit" | "exec";
   user: TaskUser;
 }
 
@@ -319,9 +323,22 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       () => {},
       (error) => {
         if (error === HALT_TASK) return;
+        // The kernel left the coroutine by a trap, which no cleanup in a
+        // program's frames can catch: the task exited, or execs (its new
+        // program runs from user_restart).
+        const leaving = task.leaving;
+        task.leaving = undefined;
+        if (leaving === "exit") return;
+        if (leaving === "exec" && !finished) {
+          current = task;
+          task.wake = undefined;
+          run(task, kernel_exports().user_restart!);
+          return;
+        }
         // A trap (in the program, or a bug in the kernel) unwound the
-        // task's frames: the kernel ends the process with SIGSEGV, as the
-        // task (arch/wasm/exobox/fault.c), or panics if it was its own.
+        // task's frames: the kernel ends the process by the signal Linux
+        // would, as the task (arch/wasm/exobox/fault.c), or panics if it
+        // was its own.
         if (error instanceof Wasm.RuntimeError && fn !== kernel_exports().user_fault && !finished) {
           stop_running();
           current = task;
@@ -432,16 +449,23 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         }),
       );
     }),
-    // A task that ended: on to the next, and its coroutine unwinds.
+    // A task that ended: on to the next; the kernel traps out of its coroutine.
     jspi_exit(to: number) {
       stop_running();
       const next = tasks_by_ptr.get(to);
       assert(next, `jspi_exit: no task ${to.toString(16)}`);
       const task = current;
-      if (task?.ptr !== undefined) tasks_by_ptr.delete(task.ptr);
-      task?.user.release();
+      assert(task, "jspi_exit with no task");
+      if (task.ptr !== undefined) tasks_by_ptr.delete(task.ptr);
+      task.user.release();
+      task.leaving = "exit";
       resume(next);
-      throw HALT_TASK;
+    },
+    // exec: the kernel traps out of the old program, then the task runs user_restart.
+    jspi_restart() {
+      stop_running();
+      assert(current, "jspi_restart with no task");
+      current.leaving = "exec";
     },
     // The idle task: wait for an interrupt, or the next timer.
     jspi_idle: new Wasm.Suspending((word: number, timeout: bigint) => {
@@ -735,6 +759,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     bootConsole: boot_console.readable,
     closed: closed.promise,
     terminated: terminated.promise,
+    debugTasks: () => (kernel_exports().debug_tasks as Fn)(),
     close,
     [Symbol.dispose]: close,
     async [Symbol.asyncDispose]() {
