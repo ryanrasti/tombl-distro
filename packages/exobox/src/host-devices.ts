@@ -25,13 +25,19 @@ export interface HostDevicesOptions {
 const EIO = -5;
 const EROFS = -30;
 
-export function hostDevices({ input, output, disks = [] }: HostDevicesOptions): MachineExtension {
+export interface HostDevices extends MachineExtension {
+  /** Settles once what the console has written so far has reached `output`. */
+  flushed(): Promise<void>;
+}
+
+export function hostDevices({ input, output, disks = [] }: HostDevicesOptions): HostDevices {
+  let writes: Promise<void> = Promise.resolve();
   return {
+    flushed: () => writes,
     kernel_imports({ memory, raise_irq }) {
       let console_irq = 0;
       const input_buffer: number[] = [];
       const writer = output?.getWriter();
-      let writes: Promise<void> = Promise.resolve();
       if (input) {
         const reader = input.getReader();
         void (async () => {

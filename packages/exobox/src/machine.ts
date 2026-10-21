@@ -113,6 +113,8 @@ export interface JspiMachineOptions {
   plugins?: readonly MachinePluginInput[];
   /** Kernel imports from outside @lowland/kernel. */
   extensions?: readonly MachineExtension[];
+  /** An initial ramdisk (a cpio archive), unpacked as the root filesystem. */
+  initcpio?: Uint8Array;
   /** The memory the kernel is told it has, in MiB (default: all of 4 GiB). */
   memory_mib?: number;
   /**
@@ -131,14 +133,16 @@ export interface JspiMachine extends Machine {
 /** A program unwound for fork: its stack pointer and Asyncify buffer, which its copy rewinds from. */
 interface Unwound {
   stack_pointer: number;
+  /** the forking thread's thread-local storage (if the program has any) */
+  tls_base?: number;
   asyncify_data: number;
 }
 
-/** A program's Asyncify buffer, for its stack during fork (grown onto its memory). */
-const ASYNCIFY_DATA_SIZE = 2 * PAGE_SIZE;
-
 interface AsyncifyExports {
   __stack_pointer: globalThis.WebAssembly.Global;
+  __tls_base?: globalThis.WebAssembly.Global;
+  /** libc's buffer for the saved stack: Asyncify's header (next, end), then its start */
+  __wasm_fork_buffer(): number;
   asyncify_start_unwind(data: number): void;
   asyncify_stop_unwind(): void;
   asyncify_start_rewind(data: number): void;
@@ -185,7 +189,15 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   const configured = await configure_machine(options.args ?? [], options.plugins ?? []);
   const { devices, plugins } = configured;
 
-  const { memory, maximum_pages } = allocate_shared_memory(options.kernel.memory_pages, KERNEL_MEMORY_MAXIMUM_PAGES);
+  // (the initramfs right after the kernel's data, as @lowland/kernel puts it)
+  const initcpio = options.initcpio;
+  const initcpio_address = options.kernel.memory_pages * PAGE_SIZE;
+  const initcpio_pages = initcpio ? Math.ceil(initcpio.byteLength / PAGE_SIZE) : 0;
+  const { memory, maximum_pages } = allocate_shared_memory(
+    options.kernel.memory_pages + initcpio_pages,
+    KERNEL_MEMORY_MAXIMUM_PAGES,
+  );
+  if (initcpio) new Uint8Array(memory.buffer).set(initcpio, initcpio_address);
   const memory_pages = options.memory_mib
     ? Math.min(maximum_pages, (options.memory_mib * 1024 * 1024) / PAGE_SIZE)
     : maximum_pages;
@@ -212,18 +224,27 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       config: device.config,
     };
   }
+  if (initcpio) {
+    const chosen = devicetree.chosen as DeviceTreeNode;
+    chosen["linux,initrd-start"] = initcpio_address;
+    chosen["linux,initrd-end"] = initcpio_address + initcpio.byteLength;
+  }
   merge_device_tree(devicetree, configured.deviceTree);
-  const generated_devicetree = generate_devicetree(devicetree, { memory_reservations: [] });
+  const generated_devicetree = generate_devicetree(devicetree, {
+    memory_reservations: initcpio ? [{ address: initcpio_address, size: initcpio.byteLength }] : [],
+  });
 
   // --- the machine's end ---
   const terminated = Promise.withResolvers<MachineTerminationReason>();
   const closed = Promise.withResolvers<void>();
   void closed.promise.catch(() => {});
   void terminated.promise.catch(() => {});
+  // (closed or ended: its tasks end at their next switch, yield or idle)
   let finished = false;
   const finish = (error?: unknown) => {
     if (finished) return;
     finished = true;
+    idle_waiter?.();
     if (error !== undefined) terminated.reject(error);
     void Promise.allSettled(devices.map((device) => close_virtio_device(device))).then(() => {
       boot_console_close();
@@ -288,12 +309,27 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   function start(task: Task) {
     current = task;
     task.user.prepare();
-    const entry = Wasm.promising(kernel_exports().__indirect_function_table.get(task.fn) as Fn);
+    run(task, kernel_exports().__indirect_function_table.get(task.fn) as Fn, task.arg);
+  }
+
+  /** Runs fn(arg) as the task, on a coroutine of its own. */
+  function run(task: Task, fn: Fn, ...args: number[]) {
     start_running();
-    entry(task.arg).then(
+    Wasm.promising(fn)(...args).then(
       () => {},
       (error) => {
-        if (error !== HALT_TASK) finish(error);
+        if (error === HALT_TASK) return;
+        // A trap (in the program, or a bug in the kernel) unwound the
+        // task's frames: the kernel ends the process with SIGSEGV, as the
+        // task (arch/wasm/exobox/fault.c), or panics if it was its own.
+        if (error instanceof Wasm.RuntimeError && fn !== kernel_exports().user_fault && !finished) {
+          stop_running();
+          current = task;
+          task.wake = undefined;
+          run(task, kernel_exports().user_fault!, trap_signal(error));
+          return;
+        }
+        finish(error);
       },
     );
   }
@@ -357,6 +393,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       throw HALT_TASK;
     },
     jspi_switch: new Wasm.Suspending((from: number, to: number) => {
+      if (finished) throw HALT_TASK;
       const task = current;
       assert(task, "jspi_switch with no task");
       if (task.ptr === undefined) {
@@ -379,6 +416,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     // A task that spins (cpu_relax) lets the event loop turn: what it waits
     // for may be a host completion.
     jspi_yield: new Wasm.Suspending(() => {
+      if (finished) throw HALT_TASK;
       stop_running();
       const task = current;
       irq_raised = false;
@@ -407,6 +445,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     },
     // The idle task: wait for an interrupt, or the next timer.
     jspi_idle: new Wasm.Suspending((word: number, timeout: bigint) => {
+      if (finished) throw HALT_TASK;
       stop_running();
       drain_main_queue();
       const pending = new Int32Array(memory.buffer, word >>> 0, 2);
@@ -492,18 +531,15 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       const exports = program.exports as Partial<AsyncifyExports>;
       const can_fork =
         typeof exports.asyncify_start_unwind === "function" &&
+        typeof exports.__wasm_fork_buffer === "function" &&
         exports.__stack_pointer instanceof Wasm.Global;
       if (inherited) {
         // a fork child: the parent's memory, and its stack pointer as it unwound
         asyncify().__stack_pointer.value = inherited.stack_pointer;
+        if (inherited.tls_base !== undefined && exports.__tls_base instanceof Wasm.Global)
+          exports.__tls_base.value = inherited.tls_base;
         inherited = null;
-      } else if (can_fork) {
-        try {
-          asyncify_data = context!.memory.grow(ASYNCIFY_DATA_SIZE / PAGE_SIZE) * PAGE_SIZE;
-        } catch {
-          asyncify_data = 0;
-        }
-      } else asyncify_data = 0;
+      } else asyncify_data = can_fork ? asyncify().__wasm_fork_buffer() >>> 0 : 0;
       release_slots();
       entry_slot = slot_for(program.exports._start);
     }
@@ -590,15 +626,19 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         // fork (arch/wasm/exobox/fork.c): the program's stack, saved into its memory and back
         can_fork: () => (asyncify_data ? 1 : 0),
         start_unwind() {
-          // (the buffer's header: where its saved frames go, and its end)
-          const header = new DataView(context!.memory.buffer, asyncify_data, 8);
-          header.setUint32(0, asyncify_data + 8, true);
-          header.setUint32(4, asyncify_data + ASYNCIFY_DATA_SIZE, true);
+          // (libc's header: Asyncify's next and end, then the start, where next goes back to)
+          const header = new DataView(context!.memory.buffer, asyncify_data, 12);
+          header.setUint32(0, header.getUint32(8, true), true);
           asyncify().asyncify_start_unwind(asyncify_data);
         },
         stop_unwind() {
           asyncify().asyncify_stop_unwind();
-          unwound = { stack_pointer: asyncify().__stack_pointer.value, asyncify_data };
+          const { __stack_pointer, __tls_base } = asyncify();
+          unwound = {
+            stack_pointer: __stack_pointer.value,
+            tls_base: __tls_base instanceof Wasm.Global ? __tls_base.value : undefined,
+            asyncify_data,
+          };
         },
         start_rewind() {
           unwound = null;
@@ -710,6 +750,14 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     throw error;
   }
   return machine;
+}
+
+/** The signal Linux kills a process by for what trapped (V8's messages). */
+function trap_signal(error: Error): number {
+  const SIGILL = 4, SIGFPE = 8, SIGSEGV = 11;
+  if (/unreachable/.test(error.message)) return SIGILL;
+  if (/divide by zero|remainder by zero|integer overflow|float unrepresentable/.test(error.message)) return SIGFPE;
+  return SIGSEGV;
 }
 
 /** Lets the event loop turn once (I/O and timers included), then runs `f`. */

@@ -12,4 +12,4 @@ export {
   type MachineStats,
   machine_stats,
 } from "./machine.ts";
-export { type HostDevicesOptions, hostDevices } from "./host-devices.ts";
+export { type HostDevices, type HostDevicesOptions, type HostDisk, hostDevices } from "./host-devices.ts";
