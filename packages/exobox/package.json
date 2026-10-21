@@ -1,0 +1,21 @@
+{
+  "name": "@exobox/kernel-host",
+  "version": "0.0.0",
+  "private": true,
+  "description": "exobox's additions to @lowland/kernel: a single-event-loop (JSPI) machine, the exec cache, and console and disks as direct host calls.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@lowland/bytes": "workspace:*",
+    "@lowland/kernel": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^7"
+  }
+}
