@@ -128,6 +128,23 @@ export interface JspiMachine extends Machine {
   readonly terminated: Promise<MachineTerminationReason>;
 }
 
+/** A program unwound for fork: its stack pointer and Asyncify buffer, which its copy rewinds from. */
+interface Unwound {
+  stack_pointer: number;
+  asyncify_data: number;
+}
+
+/** A program's Asyncify buffer, for its stack during fork (grown onto its memory). */
+const ASYNCIFY_DATA_SIZE = 2 * PAGE_SIZE;
+
+interface AsyncifyExports {
+  __stack_pointer: globalThis.WebAssembly.Global;
+  asyncify_start_unwind(data: number): void;
+  asyncify_stop_unwind(): void;
+  asyncify_start_rewind(data: number): void;
+  asyncify_stop_rewind(): void;
+}
+
 interface Task {
   name: string;
   fn: number;
@@ -142,6 +159,8 @@ interface Task {
 /** A task's user side: its program, and the user imports acting for it. */
 interface TaskUser {
   readonly context: UserContext | null;
+  /** For a fork child: where the parent's program unwound (its stack pointer, Asyncify buffer). */
+  readonly unwound: Unwound | null;
   prepare(): void;
   /** Frees its program's kernel-table slots (it exited). */
   release(): void;
@@ -297,7 +316,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       stats.copy_ms += performance.now() - t;
     }
     const task: Task = { name, fn, arg, started: false, user: undefined as never };
-    task.user = user_imports(task, context);
+    task.user = user_imports(task, context, copy ? (current?.user.unwound ?? null) : null);
     stats.tasks++;
     // The first task (setup.c's "boot") runs now; the others' bootstrap args
     // start with their task_struct, which __switch_to names them by.
@@ -416,8 +435,12 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   };
 
   // --- user imports: the current task's ---
-  function user_imports(_task: Task, parent: UserContext | null): TaskUser {
+  function user_imports(_task: Task, parent: UserContext | null, inherited: Unwound | null): TaskUser {
     let context = parent;
+    /** this program's Asyncify buffer (0: it can't fork) */
+    let asyncify_data = inherited?.asyncify_data ?? 0;
+    let unwound: Unwound | null = null;
+    const asyncify = () => program!.exports as unknown as AsyncifyExports;
     let pending: UserContext | null = null;
     let pending_bytes: Uint8Array<ArrayBuffer> | null = null;
     let pending_key: string | null = null;
@@ -466,6 +489,21 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       });
       stats.user_instance_ms += performance.now() - t;
       stats.instances++;
+      const exports = program.exports as Partial<AsyncifyExports>;
+      const can_fork =
+        typeof exports.asyncify_start_unwind === "function" &&
+        exports.__stack_pointer instanceof Wasm.Global;
+      if (inherited) {
+        // a fork child: the parent's memory, and its stack pointer as it unwound
+        asyncify().__stack_pointer.value = inherited.stack_pointer;
+        inherited = null;
+      } else if (can_fork) {
+        try {
+          asyncify_data = context!.memory.grow(ASYNCIFY_DATA_SIZE / PAGE_SIZE) * PAGE_SIZE;
+        } catch {
+          asyncify_data = 0;
+        }
+      } else asyncify_data = 0;
       release_slots();
       entry_slot = slot_for(program.exports._start);
     }
@@ -482,6 +520,9 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     return {
       get context() {
         return context;
+      },
+      get unwound() {
+        return unwound;
       },
       prepare() {
         if (context) instantiate();
@@ -546,6 +587,26 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
           instantiate();
         },
         entry: () => entry_slot,
+        // fork (arch/wasm/exobox/fork.c): the program's stack, saved into its memory and back
+        can_fork: () => (asyncify_data ? 1 : 0),
+        start_unwind() {
+          // (the buffer's header: where its saved frames go, and its end)
+          const header = new DataView(context!.memory.buffer, asyncify_data, 8);
+          header.setUint32(0, asyncify_data + 8, true);
+          header.setUint32(4, asyncify_data + ASYNCIFY_DATA_SIZE, true);
+          asyncify().asyncify_start_unwind(asyncify_data);
+        },
+        stop_unwind() {
+          asyncify().asyncify_stop_unwind();
+          unwound = { stack_pointer: asyncify().__stack_pointer.value, asyncify_data };
+        },
+        start_rewind() {
+          unwound = null;
+          asyncify().asyncify_start_rewind(asyncify_data);
+        },
+        stop_rewind() {
+          asyncify().asyncify_stop_rewind();
+        },
         func(fn: number) {
           let slot = slots.get(fn);
           if (slot === undefined) {
@@ -601,7 +662,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
 
   // The shared instance's user imports act for the current task.
   const user = Object.fromEntries(
-    Object.keys(user_imports({} as Task, null).imports).map((name) => [
+    Object.keys(user_imports({} as Task, null, null).imports).map((name) => [
       name,
       (...args: number[]) => (current!.user.imports as unknown as Record<string, Fn>)[name]!(...args),
     ]),
