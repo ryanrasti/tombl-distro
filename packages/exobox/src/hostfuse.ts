@@ -79,7 +79,7 @@ export function hostFuse({ filesystems, stats, on_error = console.error }: HostF
   return {
     describe: () =>
       [...connections].map(([conn, c]) => `hostfuse ${conn}: ${c.pending} in progress, ${c.done.length} done not taken`).join("\n"),
-    kernel_imports({ memory, raise_irq }) {
+    kernel_imports({ memory, raise_irq, host_work }) {
       /** the pieces at `at`: [base, len] each */
       const pieces = (at: number, n: number): [number, number][] => {
         const view = new DataView(memory.buffer);
@@ -122,7 +122,7 @@ export function hostFuse({ filesystems, stats, on_error = console.error }: HostF
             stats.by_opcode[opcode] = (stats.by_opcode[opcode] ?? 0) + 1;
           }
           c.pending++;
-          c.queue = c.queue.then(async () => {
+          const work = c.queue.then(async () => {
             let ret: number;
             try {
               const started = stats ? performance.now() : 0;
@@ -139,6 +139,8 @@ export function hostFuse({ filesystems, stats, on_error = console.error }: HostF
             c.done.push([id, ret]);
             raise_irq(c.irq);
           });
+          // (the kernel's waiting for it: its turns of the loop come sooner)
+          c.queue = host_work(work);
           return 0;
         },
         fuse_complete(conn: number, id_ptr: number, ret_ptr: number) {
