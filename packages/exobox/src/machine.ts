@@ -17,6 +17,7 @@ import type { MachinePluginInput } from "../../kernel/src/plugin.ts";
 import { assert } from "../../kernel/src/util.ts";
 import { close_virtio_device, virtio_device_description, virtio_imports } from "../../kernel/src/virtio/core.ts";
 import { read_wasm_memories } from "../../kernel/src/wasm_binary.ts";
+import { type AsyncifyModule, Link, type Program, program as parse_program } from "./dynlink.ts";
 import {
   allocate_shared_memory,
   kernel_imports,
@@ -43,8 +44,31 @@ declare namespace WebAssembly {
 }
 const Wasm = globalThis.WebAssembly as unknown as typeof WebAssembly & typeof globalThis.WebAssembly;
 
-/** Compiled programs, by the kernel's key for their file (device:inode:size:mtime). */
-export type ExecCache = Map<string, { module: globalThis.WebAssembly.Module; minimum: number; maximum: number }>;
+/** Compiled programs and libraries, by the kernel's key for their file (device:inode:size:mtime). */
+export type ExecCache = Map<
+  string,
+  { module: globalThis.WebAssembly.Module; minimum: number; maximum: number; program: Program }
+>;
+
+/** A user context (tombl's: a program's module and memory), with its dynamic link, if any. */
+interface Context extends UserContext {
+  program?: Program;
+  /** the process's link (its main thread's): threads replay it */
+  link?: Link;
+}
+
+/** exec of a dynamically linked program: its libraries, as the kernel sends them (exec_lib) */
+interface ExecLibraries {
+  main: Program;
+  /** loaded, by needed name, in the order found (breadth first) */
+  libs: Map<string, Program>;
+  queue: { name: string; dirs: string[] }[];
+  names: Set<string>;
+  /** the place (in queue[0]'s dirs) being tried */
+  dir: number;
+  /** a library the kernel sent since the last exec_lib */
+  received?: Program;
+}
 
 /** Kernel imports a machine gets from outside @lowland/kernel (`hostDevices`, ...). */
 export interface MachineExtension {
@@ -123,6 +147,8 @@ export interface JspiMachineOptions {
    */
   exec_cache?: ExecCache;
   stats?: MachineStats;
+  /** a trap in a task (which kills its process: debugging) */
+  on_trap?: (error: Error, task: string) => void;
 }
 
 export interface JspiMachine extends Machine {
@@ -138,6 +164,8 @@ interface Unwound {
   /** the forking thread's thread-local storage (if the program has any) */
   tls_base?: number;
   asyncify_data: number;
+  /** a dynamically linked process's: the forking thread's link, which the child replays */
+  link?: Link;
 }
 
 interface AsyncifyExports {
@@ -170,7 +198,7 @@ interface TaskUser {
   /** For a fork child: where the parent's program unwound (its stack pointer, Asyncify buffer). */
   readonly unwound: Unwound | null;
   prepare(): void;
-  /** Frees its program's kernel-table slots (it exited). */
+  /** Frees its program's kernel-table slots, and its thread's link (it exited). */
   release(): void;
   imports: Record<string, Function>;
 }
@@ -341,6 +369,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         // was its own.
         if (error instanceof Wasm.RuntimeError && fn !== kernel_exports().user_fault && !finished) {
           stop_running();
+          options.on_trap?.(error, task.name);
           current = task;
           task.wake = undefined;
           run(task, kernel_exports().user_fault!, trap_signal(error));
@@ -351,7 +380,8 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     );
   }
 
-  function spawn(fn: number, arg: number, name: string, parent: UserContext | null, copy: boolean): number {
+  function spawn(fn: number, arg: number, name: string, parent_context: UserContext | null, copy: boolean): number {
+    const parent = parent_context as Context | null;
     let context = parent;
     if (copy && parent) {
       // One thread: nothing else runs meanwhile, so the copy is coherent.
@@ -365,7 +395,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         return -12; // out of memory
       }
       memory_bytes(copied.memory, 0, source.byteLength)!.set(source);
-      context = { module: parent.module, ...copied };
+      context = { module: parent.module, program: parent.program, ...copied };
       stats.copy_ms += performance.now() - t;
     }
     const task: Task = { name, fn, arg, started: false, user: undefined as never };
@@ -498,13 +528,16 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   };
 
   // --- user imports: the current task's ---
-  function user_imports(_task: Task, parent: UserContext | null, inherited: Unwound | null): TaskUser {
+  function user_imports(_task: Task, parent: Context | null, inherited: Unwound | null): TaskUser {
     let context = parent;
+    /** a dynamically linked program's: this thread's link */
+    let link: Link | null = null;
+    let exec_libs: ExecLibraries | null = null;
     /** this program's Asyncify buffer (0: it can't fork) */
     let asyncify_data = inherited?.asyncify_data ?? 0;
     let unwound: Unwound | null = null;
     const asyncify = () => program!.exports as unknown as AsyncifyExports;
-    let pending: UserContext | null = null;
+    let pending: Context | null = null;
     let pending_bytes: Uint8Array<ArrayBuffer> | null = null;
     let pending_key: string | null = null;
     let program: globalThis.WebAssembly.Instance | null = null;
@@ -546,9 +579,27 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       const k = kernel_exports();
       const t = performance.now();
       // The kernel's exports themselves, not JS wrappers: no JS frame on the syscall path.
+      const linux = { syscall: k.syscall!, get_thread_area: k.get_thread_area!, copy_siginfo: k.copy_siginfo! };
+      link?.release();
+      link = null;
+      if (context!.program?.dylink) {
+        // dynamically linked: the process's link (exec), a replay of its
+        // main thread's (a thread), or of the forking thread's (fork)
+        if (inherited?.link) link = inherited.link.fork(context!.memory, linux);
+        else if (context!.link) link = context!.link.thread(linux);
+        else link = link_exec(context!, linux);
+        context!.link ??= link;
+        program = link.instance;
+        stats.user_instance_ms += performance.now() - t;
+        stats.instances++;
+        inherited = null;
+        release_slots();
+        entry_slot = slot_for(program.exports._start);
+        return;
+      }
       program = new Wasm.Instance(context!.module, {
         env: { memory: context!.memory },
-        linux: { syscall: k.syscall!, get_thread_area: k.get_thread_area!, copy_siginfo: k.copy_siginfo! },
+        linux,
       });
       stats.user_instance_ms += performance.now() - t;
       stats.instances++;
@@ -568,13 +619,52 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       entry_slot = slot_for(program.exports._start);
     }
 
-    function compiled(module: globalThis.WebAssembly.Module, minimum: number, maximum: number): number {
+    function compiled(entry: { module: globalThis.WebAssembly.Module; program: Program }, minimum: number, maximum: number): number {
+      // (a library exec_lib asked for: no memory of its own)
+      if (exec_libs) {
+        exec_libs.received = entry.program;
+        return 0;
+      }
       try {
-        pending = { module, ...allocate_shared_memory(minimum, maximum) };
+        pending = { module: entry.module, program: entry.program, ...allocate_shared_memory(minimum, maximum) };
         return 0;
       } catch {
         return -12; // out of memory
       }
+    }
+
+    /** exec's link: the program and its libraries, which exec_lib collected */
+    function link_exec(context: Context, linux: Record<string, Fn>): Link {
+      const state = exec_libs;
+      exec_libs = null;
+      // breadth first is the search order; loaded the other way, dependencies first
+      const found = state ? [...state.libs.values()] : [];
+      return new Link({
+        memory: context.memory,
+        linux,
+        main: context.program!,
+        libs: [...found].reverse(),
+        search: found,
+        onError: (...args) => console.error(...args),
+      });
+    }
+
+    /** queue the libraries p needs that aren't loaded or queued already */
+    function needs(state: ExecLibraries, p: Program) {
+      for (const name of p.dylink?.needed ?? []) {
+        if (state.names.has(name)) continue;
+        state.names.add(name);
+        const runpath = (p.dylink?.runpath ?? []).flatMap((r) => r.split(":")).filter((d) => d && !d.includes("$"));
+        state.queue.push({ name, dirs: [...runpath, "/lib", "/usr/lib"] });
+      }
+    }
+
+    /** the modules fork unwinds and rewinds together (Asyncify's) */
+    function fork_modules(): AsyncifyModule[] {
+      if (link) return link.asyncify;
+      return asyncify_data
+        ? [{ exports: program!.exports as unknown as AsyncifyModule["exports"], data: asyncify_data }]
+        : [];
     }
 
     return {
@@ -587,7 +677,10 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       prepare() {
         if (context) instantiate();
       },
-      release: release_slots,
+      release() {
+        release_slots();
+        link?.release();
+      },
       imports: {
         compile_cached(key: number, length: number, maximum_pages: number) {
           stats.first_exec_ms ??= performance.now() - started;
@@ -595,11 +688,12 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
           const hit = exec_cache.get(pending_key);
           if (!hit) return 1;
           pending_key = null;
-          return compiled(hit.module, hit.minimum, Math.min(hit.maximum, maximum_pages >>> 0));
+          return compiled(hit, hit.minimum, Math.min(hit.maximum, maximum_pages >>> 0));
         },
         compile_begin(size: number) {
           stats.first_exec_ms ??= performance.now() - started;
-          pending = null;
+          // (a library of the program's: the program stays pending)
+          if (!exec_libs) pending = null;
           try {
             pending_bytes = new Uint8Array(size >>> 0);
             return 0;
@@ -616,28 +710,62 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
           const bytes = pending_bytes;
           pending_bytes = null;
           if (!bytes) return -22; // invalid argument
-          let module: globalThis.WebAssembly.Module;
+          let entry: { module: globalThis.WebAssembly.Module; program: Program };
           let minimum: number;
           let maximum: number;
           try {
             const memory_import = read_wasm_memories(bytes).imports[0];
             if (!memory_import || memory_import.type.maximum === undefined) return -8; // exec format error
             const t = performance.now();
-            module = new Wasm.Module(bytes);
+            const module = new Wasm.Module(bytes);
             stats.compile_ms += performance.now() - t;
+            entry = { module, program: parse_program(bytes, module) };
             minimum = Number(memory_import.type.minimum);
             maximum = Number(memory_import.type.maximum);
           } catch {
             return -8; // exec format error
           }
-          if (pending_key) exec_cache.set(pending_key, { module, minimum, maximum });
+          if (pending_key) exec_cache.set(pending_key, { ...entry, minimum, maximum });
           pending_key = null;
-          return compiled(module, minimum, Math.min(maximum, maximum_pages >>> 0));
+          return compiled(entry, minimum, Math.min(maximum, maximum_pages >>> 0));
         },
         compile_abort() {
           pending = null;
           pending_bytes = null;
           pending_key = null;
+          exec_libs = null;
+        },
+        // exec, after the program: the next library to send (arch/wasm/exobox/exec.c)
+        exec_lib(buf: number, size: number, err: number) {
+          let state = exec_libs;
+          if (!state) {
+            const main = pending?.program;
+            if (!main?.dylink?.needed.length) return 0;
+            state = { main, libs: new Map(), queue: [], names: new Set(), dir: 0 };
+            exec_libs = state;
+            needs(state, main);
+          } else if (state.received) {
+            const lib = state.received;
+            state.received = undefined;
+            const next = state.queue.shift()!;
+            lib.name ??= next.name.split("/").pop();
+            state.libs.set(next.name, lib);
+            state.dir = 0;
+            needs(state, lib);
+          } else if (state.queue.length) {
+            state.dir++; // (that one couldn't be opened: err)
+          }
+          const next = state.queue[0];
+          if (!next) return 0;
+          const dirs = next.name.includes("/") ? [""] : next.dirs;
+          if (state.dir >= dirs.length) {
+            console.error(`exec: can't find shared library ${next.name} (in ${dirs.join(", ")})`);
+            return err || -2; // ENOENT
+          }
+          const path = new TextEncoder().encode(`${dirs[state.dir] ? `${dirs[state.dir]}/` : ""}${next.name}\0`);
+          if (path.length > size >>> 0) return -36; // ENAMETOOLONG
+          new Uint8Array(memory.buffer).set(path, buf >>> 0);
+          return 1;
         },
         instantiate(fresh_memory: number) {
           if (fresh_memory) {
@@ -648,15 +776,23 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         },
         entry: () => entry_slot,
         // fork (arch/wasm/exobox/fork.c): the program's stack, saved into its memory and back
-        can_fork: () => (asyncify_data ? 1 : 0),
+        can_fork: () => (fork_modules().length ? 1 : 0),
         start_unwind() {
-          // (libc's header: Asyncify's next and end, then the start, where next goes back to)
-          const header = new DataView(context!.memory.buffer, asyncify_data, 12);
-          header.setUint32(0, header.getUint32(8, true), true);
-          asyncify().asyncify_start_unwind(asyncify_data);
+          // (every module together: the stack may run through any of them)
+          for (const m of fork_modules()) {
+            const header = new DataView(context!.memory.buffer, m.data, 12);
+            // (libc's static buffer: Asyncify's next and end, then the start;
+            // the loader's: the saved frames right after the header)
+            header.setUint32(0, link ? m.data + 8 : header.getUint32(8, true), true);
+            m.exports.asyncify_start_unwind(m.data);
+          }
         },
         stop_unwind() {
-          asyncify().asyncify_stop_unwind();
+          for (const m of fork_modules()) m.exports.asyncify_stop_unwind();
+          if (link) {
+            unwound = { stack_pointer: 0, asyncify_data: 0, link };
+            return;
+          }
           const { __stack_pointer, __tls_base } = asyncify();
           unwound = {
             stack_pointer: __stack_pointer.value,
@@ -666,10 +802,10 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         },
         start_rewind() {
           unwound = null;
-          asyncify().asyncify_start_rewind(asyncify_data);
+          for (const m of fork_modules()) m.exports.asyncify_start_rewind(m.data);
         },
         stop_rewind() {
-          asyncify().asyncify_stop_rewind();
+          for (const m of fork_modules()) m.exports.asyncify_stop_rewind();
         },
         func(fn: number) {
           let slot = slots.get(fn);
