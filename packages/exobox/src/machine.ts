@@ -204,6 +204,18 @@ interface TaskUser {
 }
 
 /** Boots a machine on this event loop; resolves once the kernel is running. */
+/**
+ * The kernel's imports from module that nothing gives: a part of the
+ * kernel's config the host doesn't have (no extension for it, hostFuse's
+ * say), each failing with ENOSYS, as a device that isn't there.
+ */
+function absent_imports(vmlinux: globalThis.WebAssembly.Module, module: string): Record<string, Fn> {
+  const absent: Record<string, Fn> = {};
+  for (const i of Wasm.Module.imports(vmlinux))
+    if (i.module === module && i.kind === "function") absent[i.name] = () => -38; // ENOSYS
+  return absent;
+}
+
 export async function bootJspiMachine(options: JspiMachineOptions): Promise<JspiMachine> {
   const stats = options.stats ?? machine_stats();
   const exec_cache: ExecCache = options.exec_cache ?? new Map();
@@ -883,7 +895,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         return initramfs.byteLength;
       },
     },
-    kernel,
+    kernel: { ...absent_imports(vmlinux, "kernel"), ...kernel },
     user,
     virtio: virtio_imports({ memory, devices, on_error: finish, trigger_irq: raise_irq }),
   });
