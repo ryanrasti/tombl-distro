@@ -127,10 +127,28 @@ export interface KernelImage {
 
 /** Compiles a kernel built with CONFIG_WASM_JSPI. */
 export async function kernelImage(bytes: Uint8Array<ArrayBuffer>): Promise<KernelImage> {
+  return { module: await Wasm.compile(bytes), memory_pages: kernelMemoryPages(bytes) };
+}
+
+/** A kernel's memory's minimum, in wasm pages, from its bytes (for a KernelImage compiled ahead of time). */
+export function kernelMemoryPages(bytes: Uint8Array): number {
   const memory = read_wasm_memories(bytes).imports[0];
   assert(memory?.module === "env" && memory.name === "memory", "Kernel memory must be imported as env.memory");
   assert(memory.type.shared, "Kernel memory must be shared");
-  return { module: await Wasm.compile(bytes), memory_pages: Number(memory.type.minimum) };
+  return Number(memory.type.minimum);
+}
+
+/**
+ * A kernel compiled ahead of time, where nothing compiles at runtime
+ * (Workers: a module uploaded with the Worker, statically imported), and its
+ * memory's minimum (kernelMemoryPages of its bytes, worked out then).
+ */
+export function precompiledKernel(module: globalThis.WebAssembly.Module, memory_pages: number): KernelImage {
+  assert(
+    Wasm.Module.imports(module).some((i) => i.module === "env" && i.name === "memory" && i.kind === "memory"),
+    "Kernel memory must be imported as env.memory",
+  );
+  return { module, memory_pages };
 }
 
 export interface JspiMachineOptions {
@@ -143,8 +161,17 @@ export interface JspiMachineOptions {
   extensions?: readonly MachineExtension[];
   /** An initial ramdisk (a cpio archive), unpacked as the root filesystem. */
   initcpio?: Uint8Array;
-  /** The memory the kernel is told it has, in MiB (default: all of 4 GiB). */
+  /**
+   * The memory the kernel is told it has, in MiB (default: all of 4 GiB),
+   * and so the most its shared memory reserves.
+   */
   memory_mib?: number;
+  /**
+   * A process's memory's most, in MiB (its program's declared maximum if
+   * less; default none): a shared memory reserves its maximum at once,
+   * which a host with little memory may refuse (Workers' isolate: 128 MB).
+   */
+  max_process_mib?: number;
   /**
    * Compiled programs to reuse, shared by machines whose disks hold the same
    * files under the same keys (default: this machine's own).
@@ -216,6 +243,8 @@ interface TaskUser {
 /** Boots a machine on this event loop; resolves once the kernel is running. */
 export async function bootJspiMachine(options: JspiMachineOptions): Promise<JspiMachine> {
   const stats = options.stats ?? machine_stats();
+  /** a process's memory's most, in pages (max_process_mib) */
+  const process_pages = options.max_process_mib ? (options.max_process_mib * 1024 * 1024) / PAGE_SIZE : Infinity;
   const exec_cache: ExecCache = options.exec_cache ?? new Map();
   const vmlinux = options.kernel.module;
   const started = performance.now();
@@ -235,9 +264,12 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   const initcpio = options.initcpio;
   const initcpio_address = options.kernel.memory_pages * PAGE_SIZE;
   const initcpio_pages = initcpio ? Math.ceil(initcpio.byteLength / PAGE_SIZE) : 0;
+  const initial_pages = options.kernel.memory_pages + initcpio_pages;
   const { memory, maximum_pages } = allocate_shared_memory(
-    options.kernel.memory_pages + initcpio_pages,
-    KERNEL_MEMORY_MAXIMUM_PAGES,
+    initial_pages,
+    options.memory_mib
+      ? Math.max(initial_pages, Math.min(KERNEL_MEMORY_MAXIMUM_PAGES, (options.memory_mib * 1024 * 1024) / PAGE_SIZE))
+      : KERNEL_MEMORY_MAXIMUM_PAGES,
   );
   if (initcpio) new Uint8Array(memory.buffer).set(initcpio, initcpio_address);
   const memory_pages = options.memory_mib
@@ -643,7 +675,11 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         return 0;
       }
       try {
-        pending = { module: entry.module, program: entry.program, ...allocate_shared_memory(minimum, maximum) };
+        pending = {
+          module: entry.module,
+          program: entry.program,
+          ...allocate_shared_memory(minimum, Math.max(minimum, Math.min(maximum, process_pages))),
+        };
         return 0;
       } catch {
         return -12; // out of memory
