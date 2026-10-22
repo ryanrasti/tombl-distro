@@ -206,6 +206,15 @@ export interface LinkOptions {
    * blocks, and its stack pointer, are the caller's to set)
    */
   replay?: { of: Link; as: "thread" | "fork" };
+  /**
+   * a fresh link's: where in the memory the loader starts placing what it
+   * grows (the main thread's stack, modules' data, Asyncify buffers,
+   * thread-local blocks): it uses the memory up to its end before growing
+   * it (default: the memory's end). A memory made larger than the program
+   * declares (machine.ts: the size its last link came to) links with no
+   * memory.grow, each of which costs; what the loader leaves is the heap's.
+   */
+  reserved?: number;
   /** a dlopen's failure */
   onError?: (...args: unknown[]) => void;
   /**
@@ -243,8 +252,10 @@ export class Link {
   #pendingRelocs: (() => void)[] = [];
   /** libraries' constructors, as table indices, for libc to run (dyn.next_ctor) */
   #ctors: number[] = [];
-  /** the process's first break (libc's __heap_end): the memory's end once linked */
+  /** the process's first break (libc's __heap_end): the loader's end once linked */
   #heapEnd = 0;
+  /** during a fresh link: where the loader places the next thing it grows, while the memory has room */
+  #next: number | undefined;
   /** the GOT entries for __heap_end, set last, past all the loader grows */
   #heapEndGot: WebAssembly.Global[] = [];
   /** fresh: not a replay (data relocated, constructors run, thread-local blocks made) */
@@ -268,6 +279,7 @@ export class Link {
     this.#onError = o.onError ?? console.error;
     this.#resolve = o.resolve;
     this.#fresh = !o.replay;
+    if (this.#fresh) this.#next = o.reserved ?? this.#memory.buffer.byteLength;
     this.#thread = o.replay?.as === "thread";
     this.#siblings = o.replay?.as === "thread" ? o.replay.of.#siblings : new Set();
     this.#siblings.add(this);
@@ -300,8 +312,10 @@ export class Link {
     this.#bind(this.#pending.splice(0));
     for (const [g, name, isWeak] of this.#pendingData.splice(0)) g.value = this.#data(name, !isWeak) ?? 0;
     for (const relocate of this.#pendingRelocs.splice(0)) relocate();
-    // (after the thread-local blocks, the last the loader grows)
-    this.#heapEnd ||= this.#memory.buffer.byteLength;
+    // (after the thread-local blocks, the last the loader grows; then what
+    // grows the memory is its own: the heap's, sbrk's, past this)
+    this.#heapEnd ||= this.#next ?? this.#memory.buffer.byteLength;
+    this.#next = undefined;
     for (const g of this.#heapEndGot) g.value = this.#heapEnd;
     const program = instanceOf(this.#program);
     this.instance = {
@@ -406,9 +420,22 @@ export class Link {
     }
   }
 
-  /** memory grown for the loader's own use (n bytes): its address */
+  /** the process's first break: where what the loader placed ends */
+  get heapEnd(): number {
+    return this.#heapEnd;
+  }
+
+  /** memory for the loader's own use (n bytes, whole pages): the memory's, while a fresh link has room, else grown. Its address */
   #grow(n: number): number {
-    return this.#memory.grow(Math.ceil(n / PAGE)) * PAGE;
+    const bytes = Math.ceil(n / PAGE) * PAGE;
+    if (this.#next !== undefined) {
+      const at = this.#next;
+      const end = this.#memory.buffer.byteLength;
+      if (at + bytes > end) this.#memory.grow((at + bytes - end) / PAGE);
+      this.#next = at + bytes;
+      return at;
+    }
+    return this.#memory.grow(bytes / PAGE) * PAGE;
   }
 
   #dynImports() {

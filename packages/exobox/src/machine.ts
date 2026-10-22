@@ -56,6 +56,10 @@ interface Context extends UserContext {
   program?: Program;
   /** the process's link (its main thread's): threads replay it */
   link?: Link;
+  /** the tasks whose memory it is (a process's threads): at none, it may go to the pool */
+  users?: number;
+  /** a dynamically linked program's memory, as it declares it (bytes): past it, the loader's */
+  declared?: number;
 }
 
 /** exec of a dynamically linked program: its libraries, as the kernel sends them (exec_lib) */
@@ -90,6 +94,8 @@ export interface MachineStats {
   user_instance_ms: number;
   /** Copying a parent's memory for a child (clone without CLONE_VM). */
   copy_ms: number;
+  /** fork children and execs given a memory from the pool (an exited process's) */
+  pool_hits: number;
   /** Kernel and user code, between resuming a task and its suspending. */
   running_ms: number;
   idle_ms: number;
@@ -109,6 +115,7 @@ export const machine_stats = (): MachineStats => ({
   compile_ms: 0,
   user_instance_ms: 0,
   copy_ms: 0,
+  pool_hits: 0,
   running_ms: 0,
   idle_ms: 0,
   idle_waits: 0,
@@ -173,6 +180,14 @@ export interface JspiMachineOptions {
    */
   max_process_mib?: number;
   /**
+   * The most, in MiB, of exited processes' memories kept for fork children
+   * and execs to reuse (default 64, or 16 with max_process_mib: a small
+   * host; 0: none): a new memory's pages fault in as they're first
+   * touched (by fork's copy, by a program's data as it starts), most of a
+   * fork's cost and much of an exec's; a used one's are in.
+   */
+  memory_pool_mib?: number;
+  /**
    * Compiled programs to reuse, shared by machines whose disks hold the same
    * files under the same keys (default: this machine's own).
    */
@@ -203,6 +218,11 @@ interface Unwound {
   asyncify_data: number;
   /** a dynamically linked process's: the forking thread's link, which the child replays */
   link?: Link;
+  /**
+   * each module's Asyncify header's next as it unwound, which the program
+   * rewinds back to: a vfork child's rewind, on the same memory, moved it
+   */
+  next: number[];
 }
 
 interface AsyncifyExports {
@@ -318,6 +338,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   const finish = (error?: unknown) => {
     if (finished) return;
     finished = true;
+    pool.length = 0;
     idle_waiter?.();
     if (error !== undefined) terminated.reject(error);
     void Promise.allSettled(devices.map((device) => close_virtio_device(device))).then(() => {
@@ -422,6 +443,61 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     );
   }
 
+  // --- the memory pool: exited processes' memories, for fork children and execs ---
+  // A memory is pooled when no task has it any more (its process exited or
+  // exec'd: Context.users), and given to a fork child whose parent's memory
+  // is no larger and has the same maximum, or to an exec whose program's
+  // memory is no larger (as it declares it; or, linked dynamically, as its
+  // last link came to) and has the same maximum. Larger by a quarter at
+  // most (or 1 MiB): the child has it all, the rest of it its heap's (libc's
+  // sbrk starts at the memory's end, the loader too). The child's copy
+  // overwrites all of the parent's extent, and what's past it (an exec's:
+  // all of it) is zeroed, so nothing of the process that had it shows.
+  // Bounded in bytes and entries, oldest dropped first; emptied when the
+  // machine ends.
+  const pool: Context[] = [];
+  let pool_bytes = 0;
+  const pool_limit = (options.memory_pool_mib ?? (options.max_process_mib ? 16 : 64)) * 1024 * 1024;
+  const POOL_ENTRIES = 8;
+  const retain = (context: Context | null) => {
+    if (context) context.users = (context.users ?? 0) + 1;
+  };
+  const unretain = (context: Context | null) => {
+    if (!context || --context.users! > 0) return;
+    const bytes = context.memory.buffer.byteLength;
+    if (finished || bytes > pool_limit) return;
+    // (only what reuse needs: not the program or link, which the pool would keep alive)
+    pool.push({ module: context.module, memory: context.memory, maximum_pages: context.maximum_pages });
+    pool_bytes += bytes;
+    while (pool.length > POOL_ENTRIES || pool_bytes > pool_limit) pool_bytes -= pool.shift()!.memory.buffer.byteLength;
+  };
+  /**
+   * A pooled memory of at least `bytes` (and at most a quarter more, or 1
+   * MiB) and maximum `maximum_pages`, zeroed past `keep` (what the caller
+   * overwrites): the smallest such.
+   */
+  const pooled = (bytes: number, maximum_pages: number, keep: number) => {
+    let best: Context | undefined;
+    const most = bytes + Math.max(bytes / 4, 1024 * 1024);
+    for (const c of pool) {
+      const size = c.memory.buffer.byteLength;
+      if (c.maximum_pages === maximum_pages && size >= bytes && size <= most && (!best || size < best.memory.buffer.byteLength))
+        best = c;
+    }
+    if (!best) return null;
+    pool.splice(pool.indexOf(best), 1);
+    pool_bytes -= best.memory.buffer.byteLength;
+    zero(memory_bytes(best.memory, keep)!);
+    stats.pool_hits++;
+    return { memory: best.memory, maximum_pages };
+  };
+  /** zeroes, from memory (a shared memory's fill is element by element, several times slower than a copy) */
+  const zeros = new Uint8Array(1024 * 1024).fill(1).fill(0);
+  const zero = (bytes: Uint8Array) => {
+    for (let at = 0; at < bytes.byteLength; at += zeros.byteLength)
+      bytes.set(zeros.subarray(0, Math.min(zeros.byteLength, bytes.byteLength - at)), at);
+  };
+
   function spawn(fn: number, arg: number, name: string, parent_context: UserContext | null, copy: boolean): number {
     const parent = parent_context as Context | null;
     let context = parent;
@@ -430,9 +506,9 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       const t = performance.now();
       const source = memory_bytes(parent.memory, 0);
       if (!source) return -14; // bad address
-      let copied: ReturnType<typeof allocate_shared_memory>;
+      let copied = pooled(source.byteLength, parent.maximum_pages, source.byteLength);
       try {
-        copied = allocate_shared_memory(source.byteLength / PAGE_SIZE, parent.maximum_pages);
+        copied ??= allocate_shared_memory(source.byteLength / PAGE_SIZE, parent.maximum_pages);
       } catch {
         return -12; // out of memory
       }
@@ -441,7 +517,9 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       stats.copy_ms += performance.now() - t;
     }
     const task: Task = { name, fn, arg, started: false, user: undefined as never };
-    task.user = user_imports(task, context, copy ? (current?.user.unwound ?? null) : null);
+    // (a fork child, or vfork's on the same memory, rewinds from where the
+    // parent unwound; a thread starts at its function: its parent isn't unwound)
+    task.user = user_imports(task, context, current?.user.unwound ?? null);
     stats.tasks++;
     // The first task (setup.c's "boot") runs now; the others' bootstrap args
     // start with their task_struct, which __switch_to names them by.
@@ -592,6 +670,8 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   // --- user imports: the current task's ---
   function user_imports(_task: Task, parent: Context | null, inherited: Unwound | null): TaskUser {
     let context = parent;
+    retain(context);
+    let released = false;
     /** a dynamically linked program's: this thread's link */
     let link: Link | null = null;
     let exec_libs: ExecLibraries | null = null;
@@ -712,11 +792,16 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         exec_libs.received = entry.program;
         return 0;
       }
+      const maximum_pages = Math.max(minimum, Math.min(maximum, process_pages));
+      // (dynamically linked: the size its last link came to, linked_pages)
+      const dynamic = !!entry.program.dylink;
+      const pages = dynamic ? Math.min(maximum_pages, Math.max(minimum, linked_pages.get(entry.module) ?? 0)) : minimum;
       try {
         pending = {
           module: entry.module,
           program: entry.program,
-          ...allocate_shared_memory(minimum, Math.max(minimum, Math.min(maximum, process_pages))),
+          ...(pooled(pages * PAGE_SIZE, maximum_pages, 0) ?? allocate_shared_memory(pages, maximum_pages)),
+          declared: dynamic ? minimum * PAGE_SIZE : undefined,
         };
         return 0;
       } catch {
@@ -730,15 +815,18 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       exec_libs = null;
       // breadth first is the search order; loaded the other way, dependencies first
       const found = state ? [...state.libs.values()] : [];
-      return new Link({
+      const link = new Link({
         memory: context.memory,
         linux,
         main: context.program!,
         libs: [...found].reverse(),
         search: found,
+        reserved: context.declared,
         onError: (...args) => console.error(...args),
         resolve: options.modules?.resolveStub,
       });
+      linked_pages.set(context.module, Math.ceil(link.heapEnd / PAGE_SIZE));
+      return link;
     }
 
     /** queue the libraries p needs that aren't loaded or queued already */
@@ -779,6 +867,8 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       release() {
         release_slots();
         link?.release();
+        if (!released) unretain(context);
+        released = true;
       },
       imports: {
         compile_cached(key: number, length: number, maximum_pages: number) {
@@ -884,8 +974,12 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         },
         instantiate(fresh_memory: number) {
           if (fresh_memory) {
+            // (the old program never runs again, nor does the kernel reach its memory)
+            const old = context;
             context = pending;
             pending = null;
+            retain(context);
+            unretain(old);
           }
           instantiate();
         },
@@ -910,9 +1004,11 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
           }
         },
         stop_unwind() {
-          for (const m of fork_modules()) m.exports.asyncify_stop_unwind();
+          const modules = fork_modules();
+          for (const m of modules) m.exports.asyncify_stop_unwind();
+          const next = modules.map((m) => new DataView(context!.memory.buffer, m.data, 4).getUint32(0, true));
           if (link) {
-            unwound = { stack_pointer: 0, asyncify_data: 0, link };
+            unwound = { stack_pointer: 0, asyncify_data: 0, link, next };
             return;
           }
           const { __stack_pointer, __tls_base } = asyncify();
@@ -920,11 +1016,17 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
             stack_pointer: __stack_pointer.value,
             tls_base: __tls_base instanceof Wasm.Global ? __tls_base.value : undefined,
             asyncify_data,
+            next,
           };
         },
         start_rewind() {
+          // (the parent: its headers as it unwound, which a vfork child's rewind moved)
+          const next = unwound?.next;
           unwound = null;
-          for (const m of fork_modules()) m.exports.asyncify_start_rewind(m.data);
+          fork_modules().forEach((m, i) => {
+            if (next?.[i] !== undefined) new DataView(context!.memory.buffer, m.data, 4).setUint32(0, next[i]!, true);
+            m.exports.asyncify_start_rewind(m.data);
+          });
         },
         stop_rewind() {
           for (const m of fork_modules()) m.exports.asyncify_stop_rewind();
@@ -981,6 +1083,12 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   }
   /** Kernel-table slots freed by tasks that exited or exec'd. */
   const free_slots: number[] = [];
+  /**
+   * The pages a dynamically linked program's memory came to, linked (its
+   * libraries, stack and the rest placed): its next exec's memory is made
+   * that size, which the loader fills without growing it.
+   */
+  const linked_pages = new WeakMap<globalThis.WebAssembly.Module, number>();
 
   // The shared instance's user imports act for the current task.
   const user = Object.fromEntries(
