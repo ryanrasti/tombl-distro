@@ -236,6 +236,8 @@ export class Link {
   #ctors: number[] = [];
   /** the process's first break (libc's __heap_end): the memory's end once linked */
   #heapEnd = 0;
+  /** the GOT entries for __heap_end, set last, past all the loader grows */
+  #heapEndGot: WebAssembly.Global[] = [];
   /** fresh: not a replay (data relocated, constructors run, thread-local blocks made) */
   #fresh: boolean;
   #thread: boolean;
@@ -285,9 +287,11 @@ export class Link {
       this.#load(o.main, undefined, true);
     }
     this.#bind(this.#pending.splice(0));
-    this.#heapEnd ||= this.#memory.buffer.byteLength;
     for (const [g, name, isWeak] of this.#pendingData.splice(0)) g.value = this.#data(name, !isWeak) ?? 0;
     for (const relocate of this.#pendingRelocs.splice(0)) relocate();
+    // (after the thread-local blocks, the last the loader grows)
+    this.#heapEnd ||= this.#memory.buffer.byteLength;
+    for (const g of this.#heapEndGot) g.value = this.#heapEnd;
     const program = instanceOf(this.#program);
     this.instance = {
       exports: {
@@ -461,6 +465,11 @@ export class Link {
           if (!tag) this.#tags.set(imp.name, (tag = new Tag({ parameters: ["i32"] })));
           env[imp.name] = tag as WebAssembly.ImportValue;
         }
+      } else if (imp.module === "GOT.mem" && imp.name === "__heap_end") {
+        // libc's first break: no module has a heap of its own (set once linked)
+        const g = new WebAssembly.Global({ value: "i32", mutable: true }, this.#heapEnd);
+        gotMem[imp.name] = g;
+        this.#heapEndGot.push(g);
       } else if (imp.module === "GOT.mem") {
         const g = new WebAssembly.Global({ value: "i32", mutable: true }, 0);
         gotMem[imp.name] = g;
@@ -584,8 +593,6 @@ export class Link {
   #data(name: string, required: boolean): number | undefined {
     const m = this.#provider((p) => linkInfo(p).globals.has(name));
     if (m?.instance) return m.memoryBase + ((m.instance.exports[name] as WebAssembly.Global).value as number);
-    // libc's first break: no module has a heap of its own
-    if (name === "__heap_end" && this.#heapEnd) return this.#heapEnd;
     if (required) throw new Error(`dynamic link: undefined data symbol ${name}`);
   }
 }
