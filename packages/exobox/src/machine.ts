@@ -607,8 +607,21 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     const slots = new Map<number, number>();
     const own_slots: number[] = [];
     let entry_slot = 0;
+    /** why the program couldn't be instantiated when the task started (prepare) */
+    let failed: Error | null = null;
 
     const program_table = () => program!.exports.__indirect_function_table as globalThis.WebAssembly.Table;
+    /**
+     * The program's function fn (a function pointer it gave the kernel:
+     * clone's, a signal handler's); one that isn't is its fault, a trap,
+     * as call_indirect's (a raw clone(SIGCHLD) names function 17, say)
+     */
+    const program_function = (fn: number): Fn => {
+      const table = program?.exports.__indirect_function_table as globalThis.WebAssembly.Table | undefined;
+      const f = table && (fn >>> 0) < table.length ? table.get(fn >>> 0) : null;
+      if (typeof f !== "function") throw new Wasm.RuntimeError(`not a function of the program's: ${fn >>> 0}`);
+      return f as Fn;
+    };
     const slot_for = (f: unknown) => {
       const table = kernel_exports().__indirect_function_table;
       const slot = free_slots.pop() ?? table.grow(1);
@@ -647,9 +660,16 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       if (context!.program?.dylink) {
         // dynamically linked: the process's link (exec), a replay of its
         // main thread's (a thread), or of the forking thread's (fork)
-        if (inherited?.link) link = inherited.link.fork(context!.memory, linux);
-        else if (context!.link) link = context!.link.thread(linux);
-        else link = link_exec(context!, linux);
+        try {
+          if (inherited?.link) link = inherited.link.fork(context!.memory, linux);
+          else if (context!.link) link = context!.link.thread(linux);
+          else link = link_exec(context!, linux);
+        } catch (error) {
+          // (a link that fails, a library or symbol missing, is the
+          // process's fault: a trap, which kills it, not the machine)
+          console.error(error);
+          throw new Wasm.RuntimeError(`dynamic link: ${(error as Error).message}`);
+        }
         context!.link ??= link;
         program = link.instance;
         stats.user_instance_ms += performance.now() - t;
@@ -659,10 +679,15 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         entry_slot = slot_for(program.exports._start);
         return;
       }
-      program = new Wasm.Instance(context!.module, {
-        env: { memory: context!.memory },
-        linux,
-      });
+      try {
+        program = new Wasm.Instance(context!.module, {
+          env: { memory: context!.memory },
+          linux,
+        });
+      } catch (error) {
+        // (a program needing imports we don't give: its fault, as above)
+        throw new Wasm.RuntimeError(`exec: ${(error as Error).message}`);
+      }
       stats.user_instance_ms += performance.now() - t;
       stats.instances++;
       const exports = program.exports as Partial<AsyncifyExports>;
@@ -742,7 +767,14 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         return unwound;
       },
       prepare() {
-        if (context) instantiate();
+        // (a fork child's or thread's link that fails is its process's
+        // fault: it starts, and traps on entering its program, below,
+        // which kills the process, not the machine)
+        try {
+          if (context) instantiate();
+        } catch (error) {
+          failed = error as Error;
+        }
       },
       release() {
         release_slots();
@@ -857,7 +889,14 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
           }
           instantiate();
         },
-        entry: () => entry_slot,
+        entry: () => {
+          if (failed) {
+            const error = failed;
+            failed = null;
+            throw error instanceof Wasm.RuntimeError ? error : new Wasm.RuntimeError(error.message);
+          }
+          return entry_slot;
+        },
         // fork (arch/wasm/exobox/fork.c): the program's stack, saved into its memory and back
         can_fork: () => (fork_modules().length ? 1 : 0),
         start_unwind() {
@@ -893,17 +932,17 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         func(fn: number) {
           let slot = slots.get(fn);
           if (slot === undefined) {
-            slot = slot_for(program_table().get(fn >>> 0));
+            slot = slot_for(program_function(fn));
             slots.set(fn, slot);
           }
           return slot;
         },
         // (through JS: a handler can't suspend yet)
         call_signal_handler(fn: number, sig: number) {
-          (program_table().get(fn >>> 0) as Fn)(sig);
+          program_function(fn)(sig);
         },
         call_siginfo_handler(trampoline: number, fn: number, sig: number) {
-          (program_table().get(trampoline >>> 0) as Fn)(fn, sig);
+          program_function(trampoline)(fn, sig);
           return 0;
         },
         read: (to: number, from: number, n: number) =>
