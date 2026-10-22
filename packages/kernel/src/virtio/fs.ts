@@ -1055,8 +1055,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         if (data.byteLength > request.size || data.byteLength > capacity - FuseOutHeader.size) {
           throw new FSError("EIO", "filesystem returned too much data");
         }
-        payload.append(data);
-        break;
+        // (the data itself is the reply's: written straight to the guest)
+        return data;
       }
       case FuseOpcode.WRITE: {
         if (!filesystem.write) throw new UnsupportedOperation();
@@ -1191,7 +1191,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     if (payload.length > capacity - FuseOutHeader.size) {
       throw new FSError("EIO", "response exceeds the guest's response buffer");
     }
-    return payload;
+    return payload.array;
   }
 
   async function notify(queue: Virtqueue) {
@@ -1224,15 +1224,14 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           chain.release(0);
           continue;
         }
-        const response = new Bytes(FuseOutHeader.size + payload.length);
-        response.alloc(FuseOutHeader).value = {
-          len: FuseOutHeader.size + payload.length,
+        const out_header = new Bytes(FuseOutHeader.size);
+        out_header.alloc(FuseOutHeader).value = {
+          len: FuseOutHeader.size + payload.byteLength,
           error: 0,
           unique,
         };
-        response.append(payload.array);
-        scatter(buffers, response.array);
-        chain.release(response.array.byteLength);
+        // (straight from the payload into guest memory: no response copy)
+        chain.release(FuseOutHeader.size + payload.byteLength, [out_header.array, payload]);
       } catch (error) {
         if (capacity < FuseOutHeader.size) {
           chain.release(0);
