@@ -496,6 +496,19 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         }),
       );
     }),
+    // Another process's memory (arch/wasm/kernel/jspi.c's access_remote_vm):
+    // the task's, copied here, as far as its memory goes.
+    jspi_access_task(ptr: number, addr: number, buf: number, len: number, write: number) {
+      const user = tasks_by_ptr.get(ptr >>> 0)?.user.context?.memory;
+      if (!user) return 0;
+      const n = Math.max(0, Math.min(len >>> 0, user.buffer.byteLength - (addr >>> 0)));
+      const theirs = memory_bytes(user, addr >>> 0, n);
+      const ours = memory_bytes(memory, buf >>> 0, n);
+      if (!theirs || !ours) return 0;
+      if (write) theirs.set(ours);
+      else ours.set(theirs);
+      return n;
+    },
     // A task that ended: on to the next; the kernel traps out of its coroutine.
     jspi_exit(to: number) {
       stop_running();
