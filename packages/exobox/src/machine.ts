@@ -215,6 +215,11 @@ interface Unwound {
   asyncify_data: number;
   /** a dynamically linked process's: the forking thread's link, which the child replays */
   link?: Link;
+  /**
+   * each module's Asyncify header's next as it unwound, which the program
+   * rewinds back to: a vfork child's rewind, on the same memory, moved it
+   */
+  next: number[];
 }
 
 interface AsyncifyExports {
@@ -498,7 +503,9 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       stats.copy_ms += performance.now() - t;
     }
     const task: Task = { name, fn, arg, started: false, user: undefined as never };
-    task.user = user_imports(task, context, copy ? (current?.user.unwound ?? null) : null);
+    // (a fork child, or vfork's on the same memory, rewinds from where the
+    // parent unwound; a thread starts at its function: its parent isn't unwound)
+    task.user = user_imports(task, context, current?.user.unwound ?? null);
     stats.tasks++;
     // The first task (setup.c's "boot") runs now; the others' bootstrap args
     // start with their task_struct, which __switch_to names them by.
@@ -975,9 +982,11 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
           }
         },
         stop_unwind() {
-          for (const m of fork_modules()) m.exports.asyncify_stop_unwind();
+          const modules = fork_modules();
+          for (const m of modules) m.exports.asyncify_stop_unwind();
+          const next = modules.map((m) => new DataView(context!.memory.buffer, m.data, 4).getUint32(0, true));
           if (link) {
-            unwound = { stack_pointer: 0, asyncify_data: 0, link };
+            unwound = { stack_pointer: 0, asyncify_data: 0, link, next };
             return;
           }
           const { __stack_pointer, __tls_base } = asyncify();
@@ -985,11 +994,17 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
             stack_pointer: __stack_pointer.value,
             tls_base: __tls_base instanceof Wasm.Global ? __tls_base.value : undefined,
             asyncify_data,
+            next,
           };
         },
         start_rewind() {
+          // (the parent: its headers as it unwound, which a vfork child's rewind moved)
+          const next = unwound?.next;
           unwound = null;
-          for (const m of fork_modules()) m.exports.asyncify_start_rewind(m.data);
+          fork_modules().forEach((m, i) => {
+            if (next?.[i] !== undefined) new DataView(context!.memory.buffer, m.data, 4).setUint32(0, next[i]!, true);
+            m.exports.asyncify_start_rewind(m.data);
+          });
         },
         stop_rewind() {
           for (const m of fork_modules()) m.exports.asyncify_stop_rewind();
