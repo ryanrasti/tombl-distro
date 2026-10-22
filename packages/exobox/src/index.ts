@@ -12,7 +12,13 @@ export {
   type MachineStats,
   machine_stats,
 } from "./machine.ts";
-export { type HostDevices, type HostDevicesOptions, type HostDisk, hostDevices } from "./host-devices.ts";
+export {
+  type DiskResult,
+  type HostDevices,
+  type HostDevicesOptions,
+  type HostDisk,
+  hostDevices,
+} from "./host-devices.ts";
 export {
   type FuseServer,
   type HostFuse,

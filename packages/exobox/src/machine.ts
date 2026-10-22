@@ -429,10 +429,13 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   const extension_context: ExtensionContext = { memory, raise_irq };
   const kernel = {
     ...base,
-    // (a kernel with host sockets or directories, but none given: inet
-    // loopback only, no hostfuse mounts; an extension replaces these)
+    // (a kernel with host sockets, directories, a console or disks, but
+    // none given: inet loopback only, no hostfuse mounts, a console
+    // nobody reads, no disks; an extension replaces these)
     ...no_sockets,
     ...no_fuse,
+    ...no_console,
+    ...no_disks,
     ...Object.assign({}, ...(options.extensions ?? []).map((e) => e.kernel_imports(extension_context))),
     halt_worker() {
       throw HALT_TASK;
@@ -945,6 +948,26 @@ const no_fuse = {
       name,
       () => {
         throw new Error(`kernel.${name} with no host directories (fuse_connect said so)`);
+      },
+    ]),
+  ),
+};
+
+/** the console's imports (arch/wasm/exobox/console.c) with none: output dropped, no input */
+const no_console = {
+  console_write: () => {},
+  console_read: () => 0,
+  console_irq: () => {},
+};
+
+/** disks' imports (arch/wasm/exobox/hostblk.c) with none: blk_count says so */
+const no_disks = {
+  blk_count: () => 0,
+  ...Object.fromEntries(
+    ["blk_size", "blk_writable", "blk_irq", "blk_submit", "blk_complete"].map((name) => [
+      name,
+      () => {
+        throw new Error(`kernel.${name} with no disks (blk_count said so)`);
       },
     ]),
   ),
