@@ -53,7 +53,7 @@ export function hostDevices({ input, output, disks = [] }: HostDevicesOptions): 
   let writes: Promise<void> = Promise.resolve();
   return {
     flushed: () => writes,
-    kernel_imports({ memory, raise_irq }) {
+    kernel_imports({ memory, raise_irq, host_work }) {
       let console_irq = 0;
       // (chunks as they came, the first read from `consumed` on: a console
       // carrying a host protocol takes megabytes, read 16 bytes at a time)
@@ -118,7 +118,7 @@ export function hostDevices({ input, output, disks = [] }: HostDevicesOptions): 
             return EIO;
           }
           if (typeof result === "number") return result || 1; // (done)
-          void result.then((ret) => {
+          void host_work(result).then((ret) => {
             blk_done.push([id, ret]);
             if (blk_irq) raise_irq(blk_irq);
           });

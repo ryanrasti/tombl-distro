@@ -79,6 +79,14 @@ export interface ExtensionContext {
   readonly memory: globalThis.WebAssembly.Memory;
   /** Raises an interrupt and wakes the CPU if it's idle. */
   raise_irq(irq: number): void;
+  /**
+   * Host work the kernel waits for that ends by itself, soon (a disk's or a
+   * host directory's request, served from the host's files; not a socket's,
+   * which waits on a peer): `p`, counted until it settles. Meanwhile the
+   * event loop turns more often than once a time slice while a process
+   * keeps the CPU (HOST_WORK_TURN_MS), as the work needs turns of its own.
+   */
+  host_work<T>(p: Promise<T>): Promise<T>;
 }
 
 /** Where a machine's time went, filled in as it runs. */
@@ -337,6 +345,10 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   let current: Task | null = null;
   let instance: globalThis.WebAssembly.Instance;
   let idle_waiter: (() => void) | null = null;
+  /** Host work in progress (host_work). */
+  let host_working = 0;
+  /** When the loop last turned for a busy CPU (jspi_yield). */
+  let last_turn = 0;
   let irq_raised = false;
   /** run_on_main's callbacks, run only once the CPU is idle or yielding. */
   const main_queue: [number, number][] = [];
@@ -355,6 +367,27 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     irq_raised = true;
     kernel_exports().trigger_irq!(irq);
     idle_waiter?.();
+  };
+  /**
+   * The kernel's word asking it for turns of the loop at syscalls (its
+   * preempt.c's exobox_host_turn), set while host work is in progress; null
+   * if it has none.
+   */
+  let host_turn: Int32Array | null | undefined;
+  const ask_turns = (on: boolean) => {
+    if (host_turn === undefined) {
+      const word = kernel_exports().host_turn_word;
+      host_turn = word ? new Int32Array(memory.buffer, (word() as number) >>> 0, 1) : null;
+    }
+    if (host_turn) host_turn[0] = on ? 1 : 0;
+  };
+  const host_work = <T>(p: Promise<T>): Promise<T> => {
+    if (!host_working++) ask_turns(true);
+    const done = () => {
+      if (!--host_working) ask_turns(false);
+    };
+    p.then(done, done);
+    return p;
   };
 
   // A task suspended in __switch_to still holds the runqueue lock, which
@@ -468,7 +501,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     get_user_context: () => current?.user.context ?? null,
     worker_exit: unavailable,
   });
-  const extension_context: ExtensionContext = { memory, raise_irq };
+  const extension_context: ExtensionContext = { memory, raise_irq, host_work };
   const kernel = {
     ...base,
     // (a kernel with host sockets, directories, a console or disks, but
@@ -513,6 +546,9 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     // for may be a host completion.
     jspi_yield: new Wasm.Suspending(() => {
       if (finished) throw HALT_TASK;
+      // (while host work asks for turns at every syscall: one each
+      // HOST_WORK_TURN_MS at most, else the CPU goes on at once)
+      if (host_working && performance.now() - last_turn < HOST_WORK_TURN_MS) return undefined;
       stop_running();
       const task = current;
       irq_raised = false;
@@ -522,6 +558,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       if (irq_raised) return undefined;
       return new Promise<void>((resolve) =>
         next_turn(() => {
+          last_turn = performance.now();
           current = task;
           resolve();
           queueMicrotask(start_running);
@@ -1095,6 +1132,15 @@ function trap_signal(error: Error): number {
   if (/divide by zero|remainder by zero|integer overflow|float unrepresentable/.test(error.message)) return SIGFPE;
   return SIGSEGV;
 }
+
+/**
+ * While host work is in progress (host_work), the event loop turns at a
+ * syscall at most this often (ms), rather than once a time slice (the
+ * kernel's preempt.c: 10 ms): the work, a host directory's request say,
+ * needs a turn for each file operation it awaits, and the kernel's request
+ * waits for it. A turn costs some microseconds of the busy process's time.
+ */
+const HOST_WORK_TURN_MS = 0.25;
 
 /** Lets the event loop turn once (I/O and timers included), then runs `f`. */
 const next_turn: (f: () => void) => void =
