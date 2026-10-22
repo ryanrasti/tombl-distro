@@ -429,6 +429,9 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   const extension_context: ExtensionContext = { memory, raise_irq };
   const kernel = {
     ...base,
+    // (a kernel with host sockets, but no network for them: inet loopback
+    // only; an extension with a network replaces these)
+    ...no_sockets,
     ...Object.assign({}, ...(options.extensions ?? []).map((e) => e.kernel_imports(extension_context))),
     halt_worker() {
       throw HALT_TASK;
@@ -917,6 +920,21 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
 function is_trap(error: unknown): error is Error {
   return error instanceof Wasm.RuntimeError || (error instanceof RangeError && /call stack size/.test(error.message));
 }
+
+/** host sockets' imports (arch/wasm/exobox/hostsock.c) with no network: sock_init says so */
+const no_sockets = {
+  sock_init: () => 0,
+  sock_irq: () => {},
+  ...Object.fromEntries(
+    ["sock_open", "sock_connect", "sock_listen", "sock_accept", "sock_send", "sock_recv", "sock_getname",
+     "sock_shutdown", "sock_close", "sock_changed", "sock_state", "sock_pending"].map((name) => [
+      name,
+      () => {
+        throw new Error(`kernel.${name} with no network (sock_init said so)`);
+      },
+    ]),
+  ),
+};
 
 /** The signal Linux kills a process by for what trapped (V8's messages). */
 function trap_signal(error: Error): number {
