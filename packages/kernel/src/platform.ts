@@ -61,8 +61,7 @@ const web: Platform = {
     return worker_handle(worker, () => worker.terminate(), handlers);
   },
   worker_endpoint() {
-    // (a worker's scope; typed so under the DOM lib too, where self is a Window)
-    return self as unknown as Endpoint;
+    return self;
   },
   quit() {
     self.close();
