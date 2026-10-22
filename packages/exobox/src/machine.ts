@@ -58,6 +58,8 @@ interface Context extends UserContext {
   link?: Link;
   /** the tasks whose memory it is (a process's threads): at none, it may go to the pool */
   users?: number;
+  /** a dynamically linked program's memory, as it declares it (bytes): past it, the loader's */
+  declared?: number;
 }
 
 /** exec of a dynamically linked program: its libraries, as the kernel sends them (exec_lib) */
@@ -445,10 +447,14 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   // A memory is pooled when no task has it any more (its process exited or
   // exec'd: Context.users), and given to a fork child whose parent's memory
   // is no larger and has the same maximum, or to an exec whose program's
-  // memory is its size and maximum. The child's copy overwrites all of the
-  // parent's extent, and what's past it (an exec's: all of it) is zeroed,
-  // so nothing of the process that had it shows. Bounded in bytes and
-  // entries, oldest dropped first; emptied when the machine ends.
+  // memory is no larger (as it declares it; or, linked dynamically, as its
+  // last link came to) and has the same maximum. Larger by a quarter at
+  // most (or 1 MiB): the child has it all, the rest of it its heap's (libc's
+  // sbrk starts at the memory's end, the loader too). The child's copy
+  // overwrites all of the parent's extent, and what's past it (an exec's:
+  // all of it) is zeroed, so nothing of the process that had it shows.
+  // Bounded in bytes and entries, oldest dropped first; emptied when the
+  // machine ends.
   const pool: Context[] = [];
   let pool_bytes = 0;
   const pool_limit = (options.memory_pool_mib ?? (options.max_process_mib ? 16 : 64)) * 1024 * 1024;
@@ -466,12 +472,13 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     while (pool.length > POOL_ENTRIES || pool_bytes > pool_limit) pool_bytes -= pool.shift()!.memory.buffer.byteLength;
   };
   /**
-   * A pooled memory of at least `bytes` and at most `most`, and maximum
-   * `maximum_pages`, zeroed past `keep` (what the caller overwrites): the
-   * smallest such.
+   * A pooled memory of at least `bytes` (and at most a quarter more, or 1
+   * MiB) and maximum `maximum_pages`, zeroed past `keep` (what the caller
+   * overwrites): the smallest such.
    */
-  const pooled = (bytes: number, most: number, maximum_pages: number, keep: number) => {
+  const pooled = (bytes: number, maximum_pages: number, keep: number) => {
     let best: Context | undefined;
+    const most = bytes + Math.max(bytes / 4, 1024 * 1024);
     for (const c of pool) {
       const size = c.memory.buffer.byteLength;
       if (c.maximum_pages === maximum_pages && size >= bytes && size <= most && (!best || size < best.memory.buffer.byteLength))
@@ -499,9 +506,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       const t = performance.now();
       const source = memory_bytes(parent.memory, 0);
       if (!source) return -14; // bad address
-      // (a memory a quarter larger at most, or 1 MiB: the child has it all)
-      const most = source.byteLength + Math.max(source.byteLength / 4, 1024 * 1024);
-      let copied = pooled(source.byteLength, most, parent.maximum_pages, source.byteLength);
+      let copied = pooled(source.byteLength, parent.maximum_pages, source.byteLength);
       try {
         copied ??= allocate_shared_memory(source.byteLength / PAGE_SIZE, parent.maximum_pages);
       } catch {
@@ -788,13 +793,15 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         return 0;
       }
       const maximum_pages = Math.max(minimum, Math.min(maximum, process_pages));
+      // (dynamically linked: the size its last link came to, linked_pages)
+      const dynamic = !!entry.program.dylink;
+      const pages = dynamic ? Math.min(maximum_pages, Math.max(minimum, linked_pages.get(entry.module) ?? 0)) : minimum;
       try {
-        // (a memory of the program's size exactly: it sees its memory as declared)
-        const bytes = minimum * PAGE_SIZE;
         pending = {
           module: entry.module,
           program: entry.program,
-          ...(pooled(bytes, bytes, maximum_pages, 0) ?? allocate_shared_memory(minimum, maximum_pages)),
+          ...(pooled(pages * PAGE_SIZE, maximum_pages, 0) ?? allocate_shared_memory(pages, maximum_pages)),
+          declared: dynamic ? minimum * PAGE_SIZE : undefined,
         };
         return 0;
       } catch {
@@ -808,15 +815,18 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       exec_libs = null;
       // breadth first is the search order; loaded the other way, dependencies first
       const found = state ? [...state.libs.values()] : [];
-      return new Link({
+      const link = new Link({
         memory: context.memory,
         linux,
         main: context.program!,
         libs: [...found].reverse(),
         search: found,
+        reserved: context.declared,
         onError: (...args) => console.error(...args),
         resolve: options.modules?.resolveStub,
       });
+      linked_pages.set(context.module, Math.ceil(link.heapEnd / PAGE_SIZE));
+      return link;
     }
 
     /** queue the libraries p needs that aren't loaded or queued already */
@@ -1073,6 +1083,12 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   }
   /** Kernel-table slots freed by tasks that exited or exec'd. */
   const free_slots: number[] = [];
+  /**
+   * The pages a dynamically linked program's memory came to, linked (its
+   * libraries, stack and the rest placed): its next exec's memory is made
+   * that size, which the loader fills without growing it.
+   */
+  const linked_pages = new WeakMap<globalThis.WebAssembly.Module, number>();
 
   // The shared instance's user imports act for the current task.
   const user = Object.fromEntries(
