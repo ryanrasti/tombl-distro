@@ -8,9 +8,11 @@ export {
   type JspiMachineOptions,
   type KernelImage,
   kernelImage,
+  kernelMemoryPages,
   type MachineExtension,
   type MachineStats,
   machine_stats,
+  precompiledKernel,
 } from "./machine.ts";
 export {
   isStub,
