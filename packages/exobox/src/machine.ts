@@ -363,11 +363,11 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
           run(task, kernel_exports().user_restart!);
           return;
         }
-        // A trap (in the program, or a bug in the kernel) unwound the
-        // task's frames: the kernel ends the process by the signal Linux
-        // would, as the task (arch/wasm/exobox/fault.c), or panics if it
-        // was its own.
-        if (error instanceof Wasm.RuntimeError && fn !== kernel_exports().user_fault && !finished) {
+        // A trap (in the program, or a bug in the kernel), or the engine's
+        // stack overflowing, unwound the task's frames: the kernel ends the
+        // process by the signal Linux would, as the task
+        // (arch/wasm/exobox/fault.c), or panics if it was its own.
+        if (is_trap(error) && fn !== kernel_exports().user_fault && !finished) {
           stop_running();
           options.on_trap?.(error, task.name);
           current = task;
@@ -911,6 +911,11 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     throw error;
   }
   return machine;
+}
+
+/** A trap, or the engine's stack overflowing (a RangeError, not a trap: V8's own limit). */
+function is_trap(error: unknown): error is Error {
+  return error instanceof Wasm.RuntimeError || (error instanceof RangeError && /call stack size/.test(error.message));
 }
 
 /** The signal Linux kills a process by for what trapped (V8's messages). */
