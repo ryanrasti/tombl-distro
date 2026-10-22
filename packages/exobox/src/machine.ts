@@ -92,7 +92,7 @@ export interface MachineStats {
   user_instance_ms: number;
   /** Copying a parent's memory for a child (clone without CLONE_VM). */
   copy_ms: number;
-  /** fork children given a memory from the pool (an exited process's) */
+  /** fork children and execs given a memory from the pool (an exited process's) */
   pool_hits: number;
   /** Kernel and user code, between resuming a task and its suspending. */
   running_ms: number;
@@ -179,9 +179,10 @@ export interface JspiMachineOptions {
   max_process_mib?: number;
   /**
    * The most, in MiB, of exited processes' memories kept for fork children
-   * to reuse (default 64, or 16 with max_process_mib: a small host; 0:
-   * none): a new memory's pages fault in as the copy first touches them,
-   * most of a fork's cost; a used one's are in.
+   * and execs to reuse (default 64, or 16 with max_process_mib: a small
+   * host; 0: none): a new memory's pages fault in as they're first
+   * touched (by fork's copy, by a program's data as it starts), most of a
+   * fork's cost and much of an exec's; a used one's are in.
    */
   memory_pool_mib?: number;
   /**
@@ -440,13 +441,14 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     );
   }
 
-  // --- the memory pool: exited processes' memories, for fork children ---
+  // --- the memory pool: exited processes' memories, for fork children and execs ---
   // A memory is pooled when no task has it any more (its process exited or
   // exec'd: Context.users), and given to a fork child whose parent's memory
-  // is no larger and has the same maximum. The child's copy overwrites all
-  // of the parent's extent; what's past it is zeroed, so nothing of the
-  // process that had it shows. Bounded in bytes and entries, oldest dropped
-  // first; emptied when the machine ends.
+  // is no larger and has the same maximum, or to an exec whose program's
+  // memory is its size and maximum. The child's copy overwrites all of the
+  // parent's extent, and what's past it (an exec's: all of it) is zeroed,
+  // so nothing of the process that had it shows. Bounded in bytes and
+  // entries, oldest dropped first; emptied when the machine ends.
   const pool: Context[] = [];
   let pool_bytes = 0;
   const pool_limit = (options.memory_pool_mib ?? (options.max_process_mib ? 16 : 64)) * 1024 * 1024;
@@ -464,13 +466,12 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     while (pool.length > POOL_ENTRIES || pool_bytes > pool_limit) pool_bytes -= pool.shift()!.memory.buffer.byteLength;
   };
   /**
-   * A pooled memory for a copy of `bytes` (a parent's memory, of maximum
-   * `maximum_pages`), zeroed past them: the smallest one no larger than a
-   * quarter more (or 1 MiB more), which the child has whole.
+   * A pooled memory of at least `bytes` and at most `most`, and maximum
+   * `maximum_pages`, zeroed past `keep` (what the caller overwrites): the
+   * smallest such.
    */
-  const pooled = (bytes: number, maximum_pages: number) => {
+  const pooled = (bytes: number, most: number, maximum_pages: number, keep: number) => {
     let best: Context | undefined;
-    const most = bytes + Math.max(bytes / 4, 1024 * 1024);
     for (const c of pool) {
       const size = c.memory.buffer.byteLength;
       if (c.maximum_pages === maximum_pages && size >= bytes && size <= most && (!best || size < best.memory.buffer.byteLength))
@@ -479,9 +480,15 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     if (!best) return null;
     pool.splice(pool.indexOf(best), 1);
     pool_bytes -= best.memory.buffer.byteLength;
-    memory_bytes(best.memory, bytes)!.fill(0);
+    zero(memory_bytes(best.memory, keep)!);
     stats.pool_hits++;
     return { memory: best.memory, maximum_pages };
+  };
+  /** zeroes, from memory (a shared memory's fill is element by element, several times slower than a copy) */
+  const zeros = new Uint8Array(1024 * 1024).fill(1).fill(0);
+  const zero = (bytes: Uint8Array) => {
+    for (let at = 0; at < bytes.byteLength; at += zeros.byteLength)
+      bytes.set(zeros.subarray(0, Math.min(zeros.byteLength, bytes.byteLength - at)), at);
   };
 
   function spawn(fn: number, arg: number, name: string, parent_context: UserContext | null, copy: boolean): number {
@@ -492,7 +499,9 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       const t = performance.now();
       const source = memory_bytes(parent.memory, 0);
       if (!source) return -14; // bad address
-      let copied = pooled(source.byteLength, parent.maximum_pages);
+      // (a memory a quarter larger at most, or 1 MiB: the child has it all)
+      const most = source.byteLength + Math.max(source.byteLength / 4, 1024 * 1024);
+      let copied = pooled(source.byteLength, most, parent.maximum_pages, source.byteLength);
       try {
         copied ??= allocate_shared_memory(source.byteLength / PAGE_SIZE, parent.maximum_pages);
       } catch {
@@ -778,11 +787,14 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         exec_libs.received = entry.program;
         return 0;
       }
+      const maximum_pages = Math.max(minimum, Math.min(maximum, process_pages));
       try {
+        // (a memory of the program's size exactly: it sees its memory as declared)
+        const bytes = minimum * PAGE_SIZE;
         pending = {
           module: entry.module,
           program: entry.program,
-          ...allocate_shared_memory(minimum, Math.max(minimum, Math.min(maximum, process_pages))),
+          ...(pooled(bytes, bytes, maximum_pages, 0) ?? allocate_shared_memory(minimum, maximum_pages)),
         };
         return 0;
       } catch {
