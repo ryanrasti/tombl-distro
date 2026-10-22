@@ -429,9 +429,10 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   const extension_context: ExtensionContext = { memory, raise_irq };
   const kernel = {
     ...base,
-    // (a kernel with host sockets, but no network for them: inet loopback
-    // only; an extension with a network replaces these)
+    // (a kernel with host sockets or directories, but none given: inet
+    // loopback only, no hostfuse mounts; an extension replaces these)
     ...no_sockets,
+    ...no_fuse,
     ...Object.assign({}, ...(options.extensions ?? []).map((e) => e.kernel_imports(extension_context))),
     halt_worker() {
       throw HALT_TASK;
@@ -931,6 +932,19 @@ const no_sockets = {
       name,
       () => {
         throw new Error(`kernel.${name} with no network (sock_init said so)`);
+      },
+    ]),
+  ),
+};
+
+/** host directories' imports (arch/wasm/exobox/hostfuse.c) with none: mount -t hostfuse finds no filesystem */
+const no_fuse = {
+  fuse_connect: () => -2, // ENOENT
+  ...Object.fromEntries(
+    ["fuse_submit", "fuse_complete", "fuse_disconnect"].map((name) => [
+      name,
+      () => {
+        throw new Error(`kernel.${name} with no host directories (fuse_connect said so)`);
       },
     ]),
   ),

@@ -11,5 +11,9 @@ the kernel keeps its own in `arch/wasm/exobox/`:
   by the kernel's key for the file (device, inode, size, mtime).
 - **`hostDevices`**: the console and disks as direct host calls
   (`CONFIG_EXOBOX`), instead of virtio.
+- **`hostFuse`**: host directories (`CONFIG_EXOBOX_HOSTFUSE`): filesystems
+  served with FUSE, by tag (`mount -t hostfuse TAG DIR`), each request and
+  reply a list of pieces in the kernel's memory, completed by an interrupt.
+  The transport only: a `FuseServer` per tag answers the requests.
 
 What proves generic here is meant to move into @lowland/kernel.

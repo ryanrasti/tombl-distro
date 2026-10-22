@@ -42,8 +42,14 @@ export interface VirtqueueBuffer {
 
 /** A chain of descriptors making up one request. */
 export interface VirtqueueChain extends Iterable<VirtqueueBuffer> {
-  /** Completes the chain, reporting how many bytes the device wrote. */
-  release(written: number): void;
+  /**
+   * Completes the chain, reporting how many bytes the device wrote: those
+   * written to its writable buffers' arrays, or `data`'s, which are written
+   * across the writable buffers in order, straight into guest memory (no
+   * array is made for them; `data` must fit, and stay unchanged until this
+   * returns).
+   */
+  release(written: number, data?: readonly Uint8Array[]): void;
 }
 
 /**
@@ -71,6 +77,10 @@ class WritableBuffer implements VirtqueueBuffer {
     this.#length = length;
   }
 
+  get length() {
+    return this.#length;
+  }
+
   get array() {
     return (this.touched ??= new Uint8Array(this.#length));
   }
@@ -95,7 +105,11 @@ class Chain implements VirtqueueChain {
     this.#release = release;
   }
 
-  release(written: number) {
+  release(written: number, data?: readonly Uint8Array[]) {
+    if (data) {
+      this.#release(written, scatter_outputs(this.#buffers, data));
+      return;
+    }
     this.#release(
       written,
       this.#buffers.flatMap((buffer) =>
@@ -109,6 +123,39 @@ class Chain implements VirtqueueChain {
   *[Symbol.iterator]() {
     yield* this.#buffers;
   }
+}
+
+/** data's bytes across the writable buffers, in order, as views of data */
+function scatter_outputs(
+  buffers: readonly (VirtqueueBuffer | WritableBuffer)[],
+  data: readonly Uint8Array[],
+): VirtqueueOutput[] {
+  const outputs: VirtqueueOutput[] = [];
+  let part = 0;
+  let at = 0;
+  for (const buffer of buffers) {
+    if (!(buffer instanceof WritableBuffer)) continue;
+    let room = buffer.length;
+    let address = buffer.address;
+    while (room > 0 && part < data.length) {
+      const source = data[part]!;
+      const n = Math.min(room, source.byteLength - at);
+      if (n > 0) outputs.push({ address, data: source.subarray(at, at + n) });
+      address += n;
+      room -= n;
+      at += n;
+      if (at === source.byteLength) {
+        part++;
+        at = 0;
+      }
+    }
+  }
+  while (part < data.length && data[part]!.byteLength === at) {
+    part++;
+    at = 0;
+  }
+  assert(part === data.length, "virtqueue chain's writable buffers are too small");
+  return outputs;
 }
 
 export interface VirtqueueOutput {
