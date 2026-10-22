@@ -56,6 +56,8 @@ interface Context extends UserContext {
   program?: Program;
   /** the process's link (its main thread's): threads replay it */
   link?: Link;
+  /** the tasks whose memory it is (a process's threads): at none, it may go to the pool */
+  users?: number;
 }
 
 /** exec of a dynamically linked program: its libraries, as the kernel sends them (exec_lib) */
@@ -90,6 +92,8 @@ export interface MachineStats {
   user_instance_ms: number;
   /** Copying a parent's memory for a child (clone without CLONE_VM). */
   copy_ms: number;
+  /** fork children given a memory from the pool (an exited process's) */
+  pool_hits: number;
   /** Kernel and user code, between resuming a task and its suspending. */
   running_ms: number;
   idle_ms: number;
@@ -109,6 +113,7 @@ export const machine_stats = (): MachineStats => ({
   compile_ms: 0,
   user_instance_ms: 0,
   copy_ms: 0,
+  pool_hits: 0,
   running_ms: 0,
   idle_ms: 0,
   idle_waits: 0,
@@ -172,6 +177,13 @@ export interface JspiMachineOptions {
    * which a host with little memory may refuse (Workers' isolate: 128 MB).
    */
   max_process_mib?: number;
+  /**
+   * The most, in MiB, of exited processes' memories kept for fork children
+   * to reuse (default 64, or 16 with max_process_mib: a small host; 0:
+   * none): a new memory's pages fault in as the copy first touches them,
+   * most of a fork's cost; a used one's are in.
+   */
+  memory_pool_mib?: number;
   /**
    * Compiled programs to reuse, shared by machines whose disks hold the same
    * files under the same keys (default: this machine's own).
@@ -318,6 +330,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   const finish = (error?: unknown) => {
     if (finished) return;
     finished = true;
+    pool.length = 0;
     idle_waiter?.();
     if (error !== undefined) terminated.reject(error);
     void Promise.allSettled(devices.map((device) => close_virtio_device(device))).then(() => {
@@ -422,6 +435,50 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
     );
   }
 
+  // --- the memory pool: exited processes' memories, for fork children ---
+  // A memory is pooled when no task has it any more (its process exited or
+  // exec'd: Context.users), and given to a fork child whose parent's memory
+  // is no larger and has the same maximum. The child's copy overwrites all
+  // of the parent's extent; what's past it is zeroed, so nothing of the
+  // process that had it shows. Bounded in bytes and entries, oldest dropped
+  // first; emptied when the machine ends.
+  const pool: Context[] = [];
+  let pool_bytes = 0;
+  const pool_limit = (options.memory_pool_mib ?? (options.max_process_mib ? 16 : 64)) * 1024 * 1024;
+  const POOL_ENTRIES = 8;
+  const retain = (context: Context | null) => {
+    if (context) context.users = (context.users ?? 0) + 1;
+  };
+  const unretain = (context: Context | null) => {
+    if (!context || --context.users! > 0) return;
+    const bytes = context.memory.buffer.byteLength;
+    if (finished || bytes > pool_limit) return;
+    // (only what reuse needs: not the program or link, which the pool would keep alive)
+    pool.push({ module: context.module, memory: context.memory, maximum_pages: context.maximum_pages });
+    pool_bytes += bytes;
+    while (pool.length > POOL_ENTRIES || pool_bytes > pool_limit) pool_bytes -= pool.shift()!.memory.buffer.byteLength;
+  };
+  /**
+   * A pooled memory for a copy of `bytes` (a parent's memory, of maximum
+   * `maximum_pages`), zeroed past them: the smallest one no larger than a
+   * quarter more (or 1 MiB more), which the child has whole.
+   */
+  const pooled = (bytes: number, maximum_pages: number) => {
+    let best: Context | undefined;
+    const most = bytes + Math.max(bytes / 4, 1024 * 1024);
+    for (const c of pool) {
+      const size = c.memory.buffer.byteLength;
+      if (c.maximum_pages === maximum_pages && size >= bytes && size <= most && (!best || size < best.memory.buffer.byteLength))
+        best = c;
+    }
+    if (!best) return null;
+    pool.splice(pool.indexOf(best), 1);
+    pool_bytes -= best.memory.buffer.byteLength;
+    memory_bytes(best.memory, bytes)!.fill(0);
+    stats.pool_hits++;
+    return { memory: best.memory, maximum_pages };
+  };
+
   function spawn(fn: number, arg: number, name: string, parent_context: UserContext | null, copy: boolean): number {
     const parent = parent_context as Context | null;
     let context = parent;
@@ -430,9 +487,9 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       const t = performance.now();
       const source = memory_bytes(parent.memory, 0);
       if (!source) return -14; // bad address
-      let copied: ReturnType<typeof allocate_shared_memory>;
+      let copied = pooled(source.byteLength, parent.maximum_pages);
       try {
-        copied = allocate_shared_memory(source.byteLength / PAGE_SIZE, parent.maximum_pages);
+        copied ??= allocate_shared_memory(source.byteLength / PAGE_SIZE, parent.maximum_pages);
       } catch {
         return -12; // out of memory
       }
@@ -592,6 +649,8 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
   // --- user imports: the current task's ---
   function user_imports(_task: Task, parent: Context | null, inherited: Unwound | null): TaskUser {
     let context = parent;
+    retain(context);
+    let released = false;
     /** a dynamically linked program's: this thread's link */
     let link: Link | null = null;
     let exec_libs: ExecLibraries | null = null;
@@ -779,6 +838,8 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
       release() {
         release_slots();
         link?.release();
+        if (!released) unretain(context);
+        released = true;
       },
       imports: {
         compile_cached(key: number, length: number, maximum_pages: number) {
@@ -884,8 +945,12 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         },
         instantiate(fresh_memory: number) {
           if (fresh_memory) {
+            // (the old program never runs again, nor does the kernel reach its memory)
+            const old = context;
             context = pending;
             pending = null;
+            retain(context);
+            unretain(old);
           }
           instantiate();
         },
