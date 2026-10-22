@@ -18,6 +18,7 @@ import { assert } from "../../kernel/src/util.ts";
 import { close_virtio_device, virtio_device_description, virtio_imports } from "../../kernel/src/virtio/core.ts";
 import { read_wasm_memories } from "../../kernel/src/wasm_binary.ts";
 import { type AsyncifyModule, Link, type Program, program as parse_program } from "./dynlink.ts";
+import type { ModuleRegistry } from "./modules.ts";
 import {
   allocate_shared_memory,
   kernel_imports,
@@ -97,6 +98,8 @@ export interface MachineStats {
   timer_wakeups: number;
   yields: number;
   switches: number;
+  /** execs (programs and their libraries) of a module named by reference, which the registry had */
+  ref_execs: number;
   /** When the first program was exec'd (the kernel was up), from boot. */
   first_exec_ms?: number;
 }
@@ -112,6 +115,7 @@ export const machine_stats = (): MachineStats => ({
   timer_wakeups: 0,
   yields: 0,
   switches: 0,
+  ref_execs: 0,
 });
 
 /** A compiled kernel, to boot any number of machines from. */
@@ -146,6 +150,12 @@ export interface JspiMachineOptions {
    * files under the same keys (default: this machine's own).
    */
   exec_cache?: ExecCache;
+  /**
+   * Modules by their content's hash, which a file naming one runs (exec by
+   * reference: modules.ts; a kernel with CONFIG_EXOBOX_EXEC_REF), shared
+   * by the machines given it. None: a stub fails exec (ENOEXEC).
+   */
+  modules?: ModuleRegistry;
   stats?: MachineStats;
   /** a trap in a task (which kills its process: debugging) */
   on_trap?: (error: Error, task: string) => void;
@@ -653,6 +663,7 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
         libs: [...found].reverse(),
         search: found,
         onError: (...args) => console.error(...args),
+        resolve: options.modules?.resolveStub,
       });
     }
 
@@ -696,6 +707,22 @@ export async function bootJspiMachine(options: JspiMachineOptions): Promise<Jspi
           if (!hit) return 1;
           pending_key = null;
           return compiled(hit, hit.minimum, Math.min(hit.maximum, maximum_pages >>> 0));
+        },
+        // a module named by reference (arch/wasm/exobox/exec.c: an exobox.ref section)
+        exec_ref(ref: number, length: number, maximum_pages: number) {
+          stats.first_exec_ms ??= performance.now() - started;
+          if (!options.modules) return 1;
+          let hit: ReturnType<ModuleRegistry["getRef"]>;
+          try {
+            hit = options.modules.getRef(new Uint8Array(memory.buffer, ref >>> 0, length >>> 0).slice());
+          } catch (error) {
+            console.error("exec:", error);
+            return -8; // exec format error
+          }
+          if (!hit) return 1;
+          stats.ref_execs++;
+          // (a copy: the program's name is a library's own, as needed)
+          return compiled({ module: hit.module, program: { ...hit.program } }, hit.minimum, Math.min(hit.maximum, maximum_pages >>> 0));
         },
         compile_begin(size: number) {
           stats.first_exec_ms ??= performance.now() - started;

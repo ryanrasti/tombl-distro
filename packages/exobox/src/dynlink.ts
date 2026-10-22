@@ -35,9 +35,11 @@ export interface Program {
   sharedMemory: boolean;
   /** a library's name as needed or dlopened (libmount.so.1): dlopen finds a loaded library by it */
   name?: string;
+  /** its trampoline module, built ahead of time (where compiling at runtime isn't allowed: Workers) */
+  trampoline?: WebAssembly.Module;
 }
 
-interface Dylink {
+export interface Dylink {
   memSize: number;
   memAlign: number;
   tableSize: number;
@@ -50,7 +52,7 @@ interface Dylink {
   weak: Set<string>;
 }
 
-interface FuncType {
+export interface FuncType {
   params: number[];
   results: number[];
 }
@@ -103,6 +105,7 @@ function envImports(p: Program): [string, FuncType][] {
 
 const trampolines = new WeakMap<WebAssembly.Module, WebAssembly.Module>();
 function trampolineOf(p: Program): WebAssembly.Module {
+  if (p.trampoline) return p.trampoline;
   let t = trampolines.get(p.module);
   if (!t) {
     t = new WebAssembly.Module(trampolineBytes(envImports(p).map(([, s]) => s)) as Uint8Array<ArrayBuffer>);
@@ -205,6 +208,12 @@ export interface LinkOptions {
   replay?: { of: Link; as: "thread" | "fork" };
   /** a dlopen's failure */
   onError?: (...args: unknown[]) => void;
+  /**
+   * dlopen of a stub (a module naming another by its hash: machine.ts's
+   * exec by reference): the module it names, or undefined if the bytes
+   * aren't a stub (it throws if it's a stub with no module)
+   */
+  resolve?: (bytes: Uint8Array) => Program | undefined;
 }
 
 /**
@@ -242,6 +251,7 @@ export class Link {
   #fresh: boolean;
   #thread: boolean;
   #onError: (...args: unknown[]) => void;
+  #resolve?: (bytes: Uint8Array) => Program | undefined;
   /**
    * the process's live links, this one's threads' and its own: what one
    * adds later (a dlopen, a dlsym's table entry), all add, at the same
@@ -256,6 +266,7 @@ export class Link {
     this.#linux = o.linux;
     this.#memory = o.memory;
     this.#onError = o.onError ?? console.error;
+    this.#resolve = o.resolve;
     this.#fresh = !o.replay;
     this.#thread = o.replay?.as === "thread";
     this.#siblings = o.replay?.as === "thread" ? o.replay.of.#siblings : new Set();
@@ -310,12 +321,28 @@ export class Link {
 
   /** A thread's instance set: this link, replayed in the same memory. */
   thread(linux: Record<string, WasmFunction>): Link {
-    return new Link({ memory: this.#memory, linux, main: this.main, libs: [], replay: { of: this, as: "thread" } });
+    return new Link({
+      memory: this.#memory,
+      linux,
+      main: this.main,
+      libs: [],
+      replay: { of: this, as: "thread" },
+      onError: this.#onError,
+      resolve: this.#resolve,
+    });
   }
 
   /** A fork child's: this link, replayed in the copy of the memory (its stack pointer, the caller's). */
   fork(memory: WebAssembly.Memory, linux: Record<string, WasmFunction>): Link {
-    const child = new Link({ memory, linux, main: this.main, libs: [], replay: { of: this, as: "fork" } });
+    const child = new Link({
+      memory,
+      linux,
+      main: this.main,
+      libs: [],
+      replay: { of: this, as: "fork" },
+      onError: this.#onError,
+      resolve: this.#resolve,
+    });
     child.#stackPointer.value = this.#stackPointer.value;
     // (the copy has the forking thread's blocks: point each module at them)
     this.#mods.forEach((m, i) => {
@@ -337,7 +364,7 @@ export class Link {
 
   /** dlopen: load a library into the running process (its dependencies first: libc's). Its handle. */
   load(bytes: Uint8Array, name?: string): number {
-    const lib = program(bytes);
+    const lib = this.#resolve?.(bytes) ?? program(bytes);
     lib.name = name;
     const at = this.ops.length;
     this.#load(lib);
@@ -610,7 +637,7 @@ function readU32(b: Uint8Array, pos: number): [number, number] {
   throw new Error("wasm: a u32 longer than 5 bytes");
 }
 
-function parseDylink(b: Uint8Array): Dylink {
+export function parseDylink(b: Uint8Array): Dylink {
   const d: Dylink = { memSize: 0, memAlign: 0, tableSize: 0, tableAlign: 0, needed: [], runpath: [], weak: new Set() };
   const dec = new TextDecoder();
   for (let pos = 0; pos < b.length; ) {
@@ -648,7 +675,7 @@ function parseDylink(b: Uint8Array): Dylink {
 }
 
 /** Function imports' signatures, from the type and import sections; and whether the memory import is shared. */
-function parseImports(b: Uint8Array): [Map<string, FuncType>, boolean] {
+export function parseImports(b: Uint8Array): [Map<string, FuncType>, boolean] {
   const types: FuncType[] = [];
   const out = new Map<string, FuncType>();
   let shared = false;

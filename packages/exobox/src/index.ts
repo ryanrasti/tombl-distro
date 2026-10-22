@@ -13,6 +13,18 @@ export {
   machine_stats,
 } from "./machine.ts";
 export {
+  isStub,
+  type ModuleInfo,
+  ModuleRegistry,
+  moduleInfo,
+  parseRef,
+  REF_SECTION,
+  type RefEntry,
+  type RefModule,
+  refOf,
+  refStub,
+} from "./modules.ts";
+export {
   type DiskResult,
   type HostDevices,
   type HostDevicesOptions,
