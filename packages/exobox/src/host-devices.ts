@@ -36,7 +36,10 @@ export function hostDevices({ input, output, disks = [] }: HostDevicesOptions): 
     flushed: () => writes,
     kernel_imports({ memory, raise_irq }) {
       let console_irq = 0;
-      const input_buffer: number[] = [];
+      // (chunks as they came, the first read from `consumed` on: a console
+      // carrying a host protocol takes megabytes, read 16 bytes at a time)
+      const input_buffer: Uint8Array[] = [];
+      let consumed = 0;
       const writer = output?.getWriter();
       if (input) {
         const reader = input.getReader();
@@ -44,7 +47,8 @@ export function hostDevices({ input, output, disks = [] }: HostDevicesOptions): 
           for (;;) {
             const { value, done } = await reader.read();
             if (done) break;
-            input_buffer.push(...value);
+            if (!value.byteLength) continue;
+            input_buffer.push(value);
             if (console_irq) raise_irq(console_irq);
           }
         })();
@@ -57,8 +61,18 @@ export function hostDevices({ input, output, disks = [] }: HostDevicesOptions): 
           writes = writes.then(() => writer.write(bytes)).catch(() => {});
         },
         console_read(buf: number, len: number) {
-          const n = Math.min(len >>> 0, input_buffer.length);
-          new Uint8Array(memory.buffer).set(input_buffer.splice(0, n), buf >>> 0);
+          let n = 0;
+          while (n < len >>> 0 && input_buffer.length) {
+            const chunk = input_buffer[0]!;
+            const take = Math.min((len >>> 0) - n, chunk.byteLength - consumed);
+            new Uint8Array(memory.buffer).set(chunk.subarray(consumed, consumed + take), (buf >>> 0) + n);
+            n += take;
+            consumed += take;
+            if (consumed === chunk.byteLength) {
+              input_buffer.shift();
+              consumed = 0;
+            }
+          }
           return n;
         },
         console_irq(irq: number) {
