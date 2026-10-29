@@ -311,3 +311,10 @@ test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what
   assert.equal(failed.error, -13);
   await harness.close();
 });
+
+test("FSError.from gives a backend the errno the device would give the guest", () => {
+  assert.equal(FSError.from(Object.assign(new Error("x"), { code: "EMFILE" })).errno, 24);
+  assert.equal(FSError.from(new FSError("EBUSY")).errno, 16);
+  assert.equal(FSError.from("odd").errno, 5);
+  assert.equal(new FSError(72).errno, 72);
+});

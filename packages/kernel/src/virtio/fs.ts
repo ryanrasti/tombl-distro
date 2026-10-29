@@ -183,10 +183,17 @@ function errno_of(error: unknown): number {
 export class FSError extends Error {
   readonly errno: number;
 
-  constructor(code: FSErrorCode, message: string = code) {
+  /** `code`: Linux's name for the errno, or its number. */
+  constructor(code: FSErrorCode | number, message: string = String(code)) {
     super(message);
     this.name = "FSError";
-    this.errno = Errno[code];
+    this.errno = typeof code === "number" ? code : Errno[code];
+  }
+
+  /** The FSError the device would give the guest for `error` (see errno_of). */
+  static from(error: unknown): FSError {
+    if (error instanceof FSError) return error;
+    return new FSError(errno_of(error), error instanceof Error ? error.message : String(error));
   }
 }
 

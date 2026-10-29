@@ -29,6 +29,7 @@ export {
   type FSCreateContext,
   type FSDirectoryEntry,
   type FSDeviceOptions,
+  type FSEntry,
   FSError,
   type FSErrorCode,
   type FSSetAttributes,
