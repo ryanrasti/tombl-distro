@@ -20,10 +20,12 @@ const FuseOpcode = {
   SETATTR: 4,
   READLINK: 5,
   SYMLINK: 6,
+  MKNOD: 8,
   MKDIR: 9,
   UNLINK: 10,
   RMDIR: 11,
   RENAME: 12,
+  LINK: 13,
   OPEN: 14,
   READ: 15,
   WRITE: 16,
@@ -41,6 +43,9 @@ const FuseOpcode = {
   INTERRUPT: 36,
   DESTROY: 38,
   BATCH_FORGET: 42,
+  FALLOCATE: 43,
+  RENAME2: 45,
+  SYNCFS: 50,
 } as const;
 
 const FuseInitFlags = {
@@ -297,7 +302,18 @@ export interface FS<TNode, THandle> {
   mkdir?(parent: TNode, name: string, context: FSCreateContext): MaybePromise<TNode>;
   unlink?(parent: TNode, name: string): MaybePromise<void>;
   rmdir?(parent: TNode, name: string): MaybePromise<void>;
-  rename?(oldParent: TNode, oldName: string, newParent: TNode, newName: string): MaybePromise<void>;
+  /** `flags`: renameat2's (RENAME_NOREPLACE 1, RENAME_EXCHANGE 2, RENAME_WHITEOUT 4); 0 for rename. */
+  rename?(
+    oldParent: TNode,
+    oldName: string,
+    newParent: TNode,
+    newName: string,
+    flags: number,
+  ): MaybePromise<void>;
+  /** Another name for a node (a hard link): the node, now known by both. */
+  link?(node: TNode, newParent: TNode, newName: string): MaybePromise<TNode>;
+  /** A special or regular file; `context.mode` has its type bits, `rdev` a device's number. */
+  mknod?(parent: TNode, name: string, rdev: number, context: FSCreateContext): MaybePromise<TNode>;
   open?(node: TNode, flags: number): MaybePromise<THandle>;
   create?(
     parent: TNode,
@@ -312,6 +328,18 @@ export interface FS<TNode, THandle> {
   write?(node: TNode, handle: THandle, offset: bigint, data: Uint8Array): MaybePromise<number>;
   flush?(node: TNode, handle: THandle): MaybePromise<void>;
   fsync?(node: TNode, handle: THandle, dataOnly: boolean): MaybePromise<void>;
+  /** A directory's fsync (its entries made durable); without it, fsync with the directory's handle. */
+  fsyncdir?(node: TNode, handle: THandle, dataOnly: boolean): MaybePromise<void>;
+  /** fallocate(2)'s `mode` (FALLOC_FL_KEEP_SIZE 1, ...) on an open file. */
+  fallocate?(
+    node: TNode,
+    handle: THandle,
+    offset: bigint,
+    length: bigint,
+    mode: number,
+  ): MaybePromise<void>;
+  /** syncfs(2): everything written to the filesystem made durable. */
+  syncfs?(): MaybePromise<void>;
   release?(node: TNode, handle: THandle): MaybePromise<void>;
   opendir?(node: TNode, flags: number): MaybePromise<THandle>;
   readdir?(
@@ -473,6 +501,34 @@ const FuseMkdirIn = Struct({
 const FuseRenameIn = Struct({
   newdir: U64LE,
 });
+
+const FuseRename2In = Struct({
+  newdir: U64LE,
+  flags: U32LE,
+  padding: U32LE,
+});
+
+const FuseLinkIn = Struct({
+  oldnodeid: U64LE,
+});
+
+const FuseMknodIn = Struct({
+  mode: U32LE,
+  rdev: U32LE,
+  umask: U32LE,
+  padding: U32LE,
+});
+
+const FuseFallocateIn = Struct({
+  fh: U64LE,
+  offset: U64LE,
+  length: U64LE,
+  mode: U32LE,
+  padding: U32LE,
+});
+
+/** renameat2's RENAME_EXCHANGE: the two names swap their files. */
+const RENAME_EXCHANGE = 1 << 1;
 
 const FuseSetattrIn = Struct({
   valid: U32LE,
@@ -689,7 +745,9 @@ function minimum_response_capacity(opcode: number) {
       return FuseOutHeader.size + FuseInitOut.size;
     case FuseOpcode.LOOKUP:
     case FuseOpcode.SYMLINK:
+    case FuseOpcode.MKNOD:
     case FuseOpcode.MKDIR:
+    case FuseOpcode.LINK:
       return FuseOutHeader.size + FuseEntryOut.size;
     case FuseOpcode.GETATTR:
     case FuseOpcode.SETATTR:
@@ -1110,27 +1168,59 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         await method.call(filesystem, node!.node, validate_name(body.cstring()));
         break;
       }
-      case FuseOpcode.RENAME: {
+      case FuseOpcode.RENAME:
+      case FuseOpcode.RENAME2: {
         if (!filesystem.rename) throw new UnsupportedOperation();
-        const request = body.struct(FuseRenameIn);
-        const new_parent = node_record(request.newdir);
+        const { newdir, flags } =
+          header.opcode === FuseOpcode.RENAME2
+            ? body.struct(FuseRename2In)
+            : { newdir: body.struct(FuseRenameIn).newdir, flags: 0 };
+        const new_parent = node_record(newdir);
         const old_name = validate_name(body.cstring());
         const new_name = validate_name(body.cstring());
-        const moved =
-          node === new_parent ? undefined : await filesystem.lookup(node!.node, old_name);
-        const moved_record = moved && by_node.get(moved);
-        await filesystem.rename(node!.node, old_name, new_parent.node, new_name);
-        if (
-          moved_record &&
-          records.get(moved_record.id) === moved_record &&
-          moved_record.parent !== new_parent
-        ) {
-          const old_parent = moved_record.parent;
-          old_parent.children -= 1;
-          moved_record.parent = new_parent;
-          new_parent.children += 1;
-          collect_record(old_parent);
-        }
+        const known = async (parent: NodeRecord<TNode>, name: string) => {
+          if (node === new_parent) return undefined;
+          const found = await filesystem.lookup(parent.node, name);
+          return found && by_node.get(found);
+        };
+        const moved = await known(node!, old_name);
+        // An exchange moves the other file the other way.
+        const swapped = flags & RENAME_EXCHANGE ? await known(new_parent, new_name) : undefined;
+        await filesystem.rename(node!.node, old_name, new_parent.node, new_name, flags);
+        const reparent = (record: NodeRecord<TNode> | undefined, to: NodeRecord<TNode>) => {
+          if (!record || records.get(record.id) !== record || record.parent === to) return;
+          const from = record.parent;
+          from.children -= 1;
+          record.parent = to;
+          to.children += 1;
+          collect_record(from);
+        };
+        reparent(moved, new_parent);
+        reparent(swapped, node!);
+        break;
+      }
+      case FuseOpcode.LINK: {
+        if (!filesystem.link) throw new UnsupportedOperation();
+        const request = body.struct(FuseLinkIn);
+        const target = node_record(request.oldnodeid);
+        const linked = await filesystem.link(target.node, node!.node, validate_name(body.cstring()));
+        const record = record_for_node(linked, node!);
+        record.lookups += 1n;
+        write_entry(payload, record, await filesystem.getattr(linked), validity);
+        break;
+      }
+      case FuseOpcode.MKNOD: {
+        if (!filesystem.mknod) throw new UnsupportedOperation();
+        const request = body.struct(FuseMknodIn);
+        const made = await filesystem.mknod(
+          node!.node,
+          validate_name(body.cstring()),
+          request.rdev,
+          create_context(header, request.mode, request.umask & 0o777),
+        );
+        const record = record_for_node(made, node!);
+        record.lookups += 1n;
+        write_entry(payload, record, await filesystem.getattr(made), validity);
         break;
       }
       case FuseOpcode.OPEN:
@@ -1217,10 +1307,32 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
       case FuseOpcode.FSYNC:
       case FuseOpcode.FSYNCDIR: {
         const request = body.struct(FuseFsyncIn);
-        const handle = handle_record(request.fh, header.opcode === FuseOpcode.FSYNCDIR, node!);
-        if (filesystem.fsync) {
-          await filesystem.fsync(handle.node.node, handle.handle, (request.fsync_flags & 1) !== 0);
+        const directory = header.opcode === FuseOpcode.FSYNCDIR;
+        const handle = handle_record(request.fh, directory, node!);
+        const data_only = (request.fsync_flags & 1) !== 0;
+        if (directory && filesystem.fsyncdir) {
+          await filesystem.fsyncdir(handle.node.node, handle.handle, data_only);
+        } else if (filesystem.fsync) {
+          await filesystem.fsync(handle.node.node, handle.handle, data_only);
         }
+        break;
+      }
+      case FuseOpcode.FALLOCATE: {
+        if (!filesystem.fallocate) throw new UnsupportedOperation();
+        const request = body.struct(FuseFallocateIn);
+        const handle = handle_record(request.fh, false, node!);
+        await filesystem.fallocate(
+          handle.node.node,
+          handle.handle,
+          request.offset,
+          request.length,
+          request.mode,
+        );
+        break;
+      }
+      case FuseOpcode.SYNCFS: {
+        if (!filesystem.syncfs) throw new UnsupportedOperation();
+        await filesystem.syncfs();
         break;
       }
       case FuseOpcode.RELEASE:

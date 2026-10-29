@@ -13,6 +13,12 @@ const Opcode = {
   INIT: 26,
   OPENDIR: 27,
   READDIR: 28,
+  MKNOD: 8,
+  LINK: 13,
+  FSYNCDIR: 30,
+  FALLOCATE: 43,
+  RENAME2: 45,
+  SYNCFS: 50,
 } as const;
 
 const view = (bytes: Uint8Array) => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -170,5 +176,68 @@ test("virtio-fs takes a backend's cache validity and keep-cache", async () => {
   const nodeid = view(looked.payload).getBigUint64(0, true);
   const opened = await harness.request(Opcode.OPEN, nodeid, open_in());
   assert.equal(view(opened.payload).getUint32(8, true), 1 << 1, "FOPEN_KEEP_CACHE");
+  await harness.close();
+});
+
+test("virtio-fs serves hard links, mknod, rename flags, fallocate, syncfs and fsyncdir", async () => {
+  const file = { name: "f" };
+  const calls: unknown[][] = [];
+  const harness = new FuseHarness(
+    filesystem({
+      lookup: (_parent, name) => (name === "f" ? file : undefined),
+      getattr: (node) => (node === file ? { mode: 0o100644, size: 0n, nlink: 2 } : directory),
+      link: (node, _parent, name) => (calls.push(["link", node, name]), node),
+      mknod: (_parent, name, rdev, context) => (calls.push(["mknod", name, rdev, context.mode]), file),
+      rename: (_from, from, _to, to, flags) => void calls.push(["rename", from, to, flags]),
+      open: () => "handle",
+      opendir: () => "dir",
+      fallocate: (_node, handle, offset, length, mode) =>
+        void calls.push(["fallocate", handle, offset, length, mode]),
+      syncfs: () => void calls.push(["syncfs"]),
+      fsync: () => void calls.push(["fsync"]),
+      fsyncdir: (_node, handle) => void calls.push(["fsyncdir", handle]),
+    }),
+  );
+  const looked = await harness.request(Opcode.LOOKUP, ROOT, body(["str", "f"]));
+  const nodeid = view(looked.payload).getBigUint64(0, true);
+
+  const linked = await harness.request(Opcode.LINK, ROOT, body(["u64", nodeid], ["str", "g"]));
+  assert.equal(linked.error, 0);
+  assert.equal(view(linked.payload).getBigUint64(0, true), nodeid, "a link is the same node");
+
+  const made = await harness.request(
+    Opcode.MKNOD,
+    ROOT,
+    body(["u32", 0o010644], ["u32", 0], ["u32", 0o022], ["u32", 0], ["str", "p"]),
+  );
+  assert.equal(made.error, 0);
+
+  const renamed = await harness.request(
+    Opcode.RENAME2,
+    ROOT,
+    body(["u64", ROOT], ["u32", 1], ["u32", 0], ["str", "f"], ["str", "h"]),
+  );
+  assert.equal(renamed.error, 0);
+
+  const fh = view((await harness.request(Opcode.OPEN, nodeid, open_in())).payload).getBigUint64(0, true);
+  const allocated = await harness.request(
+    Opcode.FALLOCATE,
+    nodeid,
+    body(["u64", fh], ["u64", 4096n], ["u64", 8192n], ["u32", 1], ["u32", 0]),
+  );
+  assert.equal(allocated.error, 0);
+  assert.equal((await harness.request(Opcode.SYNCFS, ROOT, body(["u64", 0n]))).error, 0);
+  const dir = view((await harness.request(Opcode.OPENDIR, ROOT, open_in())).payload).getBigUint64(0, true);
+  const synced = await harness.request(Opcode.FSYNCDIR, ROOT, body(["u64", dir], ["u32", 0], ["u32", 0]));
+  assert.equal(synced.error, 0);
+
+  assert.deepEqual(calls, [
+    ["link", file, "g"],
+    ["mknod", "p", 0, 0o010644 & ~0o022],
+    ["rename", "f", "h", 1],
+    ["fallocate", "handle", 4096n, 8192n, 1],
+    ["syncfs"],
+    ["fsyncdir", "dir"],
+  ]);
   await harness.close();
 });
