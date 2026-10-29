@@ -35,13 +35,15 @@ export class VirtioBus {
     memory,
     trigger_irq,
     on_error,
+    host_work,
   }: {
     memory: WebAssembly.Memory;
     trigger_irq: (irq: number) => void;
     on_error: (error: unknown) => void;
+    host_work?: <T>(work: Promise<T>) => Promise<T>;
   }): Imports["virtio"] {
     const connected = this.#devices.map((device) =>
-      device.attach({ memory, trigger_irq, on_error }),
+      device.attach({ memory, trigger_irq, on_error, host_work }),
     );
     // each device's config irq (its setup's): a reset finished is told by it
     const config_irqs = new Map<number, number>();

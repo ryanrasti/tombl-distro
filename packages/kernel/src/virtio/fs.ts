@@ -1489,7 +1489,15 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     return payload.array;
   }
 
-  async function notify(queue: Virtqueue) {
+  /**
+   * A queue's requests, one after another, in order: the device delivers a
+   * queue's kicks one at a time (`VirtioDevice.kick`), and each request here
+   * is answered before the next is read. So the filesystem sees one request
+   * of a queue at a time. The high-priority queue carries only FORGETs,
+   * which reach the filesystem as `forget`, synchronously. Each request's
+   * work is the host's (`host_work`) until its reply is written.
+   */
+  async function notify(queue: Virtqueue, host_work: <R>(work: Promise<R>) => Promise<R>) {
     for (const chain of queue) {
       const buffers = [...chain];
       const request = concatenate(buffers, false);
@@ -1514,7 +1522,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         if (capacity < minimum_response_capacity(header.opcode)) {
           throw new FSError("EINVAL", "FUSE response buffer is too small");
         }
-        const payload = await process(header, body, capacity);
+        const payload = await host_work(process(header, body, capacity));
         if (payload === undefined) {
           chain.release(0);
           continue;
@@ -1553,12 +1561,15 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
 }
 
 class FileSystemDevice extends VirtioDevice {
-  readonly #notify: (queue: Virtqueue) => Promise<void>;
+  readonly #notify: (
+    queue: Virtqueue,
+    host_work: <R>(work: Promise<R>) => Promise<R>,
+  ) => Promise<void>;
   readonly #finalize: () => Promise<void>;
 
   constructor(
     config: Uint8Array,
-    notify: (queue: Virtqueue) => Promise<void>,
+    notify: (queue: Virtqueue, host_work: <R>(work: Promise<R>) => Promise<R>) => Promise<void>,
     finalize: () => Promise<void>,
   ) {
     // 26 is the virtio-fs device ID: a high-priority queue and one request queue.
@@ -1570,7 +1581,7 @@ class FileSystemDevice extends VirtioDevice {
   }
 
   protected kick(_vq: number, queue: Virtqueue) {
-    return this.#notify(queue);
+    return this.#notify(queue, (work) => this.host_work(work));
   }
 
   protected close() {

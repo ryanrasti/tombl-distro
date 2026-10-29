@@ -36,13 +36,18 @@ export class FuseHarness {
   #unique = 0n;
   #done: PromiseWithResolvers<void> | undefined;
 
-  constructor(filesystem: FS<object, unknown>, options: Partial<FSDeviceOptions> = {}) {
+  constructor(
+    filesystem: FS<object, unknown>,
+    options: Partial<FSDeviceOptions> = {},
+    host_work?: <T>(work: Promise<T>) => Promise<T>,
+  ) {
     this.#device = fileSystemDevice(filesystem as never, { tag: "test", ...options });
     this.#imports = attach_devices({
       memory: this.memory,
       devices: [this.#device],
       trigger_irq: () => this.#done?.resolve(),
       on_error: (error) => this.#done?.reject(error),
+      host_work,
     });
     this.#imports.enable_vring(0, 1, RING_SIZE, RING, 1);
   }

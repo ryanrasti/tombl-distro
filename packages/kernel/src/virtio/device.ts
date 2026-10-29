@@ -35,6 +35,13 @@ export interface VirtioConnectionContext {
   memory: WebAssembly.Memory;
   trigger_irq(irq: number): void;
   on_error(error: unknown): void;
+  /**
+   * Work the guest waits for that ends by itself, soon (a filesystem's
+   * request, served from the host's files), as the host counts it: its
+   * result as is. A host that turns its event loop more often while such
+   * work is in progress gives it here. Unset, nothing is counted.
+   */
+  host_work?<T>(work: Promise<T>): Promise<T>;
   // Hooks for `serveDevice`, which runs a device in a worker. They replace
   // only publication: queue traversal and the device are unchanged, while the
   // main thread retains the final writes to guest memory. A device attached
@@ -131,6 +138,7 @@ export abstract class VirtioDevice implements BusDevice {
   #config_pending = false;
   #views: boolean;
   #on_error: (error: unknown) => void = () => {};
+  #host_work: (<T>(work: Promise<T>) => Promise<T>) | undefined;
 
   constructor({
     id,
@@ -174,6 +182,11 @@ export abstract class VirtioDevice implements BusDevice {
 
   /** Releases the backend, after in-flight kicks have settled. Called once. */
   protected close(): void | PromiseLike<void> {}
+
+  /** `work`, as the host counts work the guest waits for (`VirtioConnectionContext.host_work`). */
+  protected host_work<T>(work: Promise<T>): Promise<T> {
+    return this.#host_work ? this.#host_work(work) : work;
+  }
 
   /** Whether the device has started shutting down. */
   protected get stopped() {
@@ -252,6 +265,7 @@ export abstract class VirtioDevice implements BusDevice {
     assert(!this.#stopped, "cannot attach a closed virtio device");
     assert(!this.#attached, "virtio device is already attached");
     this.#on_error = context.on_error;
+    this.#host_work = context.host_work;
     const queues: QueueState[] = [];
     const queue_state = (vq: number) =>
       (queues[vq] ??= { queue: undefined, pending: false, notifying: false });

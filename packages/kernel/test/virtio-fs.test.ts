@@ -318,3 +318,50 @@ test("FSError.from gives a backend the errno the device would give the guest", (
   assert.equal(FSError.from("odd").errno, 5);
   assert.equal(new FSError(72).errno, 72);
 });
+
+test("virtio-fs passes each request's work through the host's host_work, until its reply is written", async () => {
+  const works: Promise<unknown>[] = [];
+  let replied = false;
+  const harness = new FuseHarness(filesystem(), {}, (work) => {
+    works.push(work);
+    return work.then((value) => {
+      assert.equal(replied, false);
+      return value;
+    });
+  });
+  const getattr = () => harness.request(Opcode.GETATTR, ROOT, body(["u32", 0], ["u32", 0], ["u64", 0n]));
+  assert.equal((await getattr()).error, 0);
+  replied = true;
+  assert.equal(works.length, 1);
+  replied = false;
+  await getattr();
+  assert.equal(works.length, 2);
+  await harness.close();
+});
+
+test("virtio-fs's shutdown waits for a request in flight, then lets the filesystem go", async () => {
+  const order: string[] = [];
+  const gate = Promise.withResolvers<void>();
+  const harness = new FuseHarness(
+    filesystem({
+      getattr: async () => {
+        order.push("getattr");
+        await gate.promise;
+        order.push("getattr done");
+        return directory;
+      },
+      destroy: () => {
+        order.push("destroy");
+      },
+    }),
+  );
+  const reply = harness.request(Opcode.GETATTR, ROOT, body(["u32", 0], ["u32", 0], ["u64", 0n]));
+  await new Promise((resolve) => setImmediate(resolve));
+  const closed = harness.close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["getattr"]);
+  gate.resolve();
+  await closed;
+  await reply;
+  assert.deepEqual(order, ["getattr", "getattr done", "destroy"]);
+});
