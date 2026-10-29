@@ -88,27 +88,74 @@ const DirentType = {
   socket: 12,
 } as const;
 
+// Linux's errno values (asm-generic/errno-base.h and errno.h): what the guest
+// is told, whatever the host's own numbers are.
 const Errno = {
   EPERM: 1,
   ENOENT: 2,
+  ESRCH: 3,
+  EINTR: 4,
   EIO: 5,
+  ENXIO: 6,
+  E2BIG: 7,
   EBADF: 9,
+  EAGAIN: 11,
+  ENOMEM: 12,
   EACCES: 13,
+  EFAULT: 14,
+  EBUSY: 16,
   EEXIST: 17,
+  EXDEV: 18,
+  ENODEV: 19,
   ENOTDIR: 20,
   EISDIR: 21,
   EINVAL: 22,
+  ENFILE: 23,
+  EMFILE: 24,
+  ENOTTY: 25,
+  ETXTBSY: 26,
+  EFBIG: 27,
   ENOSPC: 28,
+  ESPIPE: 29,
   EROFS: 30,
-  EPROTO: 71,
+  EMLINK: 31,
+  ERANGE: 34,
+  EDEADLK: 35,
   ENAMETOOLONG: 36,
+  ENOLCK: 37,
   ENOSYS: 38,
   ENOTEMPTY: 39,
   ELOOP: 40,
+  ENODATA: 61,
+  EPROTO: 71,
+  EOVERFLOW: 75,
   EOPNOTSUPP: 95,
+  ENOTSUP: 95,
+  ETIMEDOUT: 110,
+  ESTALE: 116,
+  EDQUOT: 122,
+  ECANCELED: 125,
 } as const;
 
 export type FSErrorCode = keyof typeof Errno;
+
+/**
+ * The errno to give the guest for an error a backend threw: an FSError's own;
+ * a host error's by its code (Node's `code`) when Linux has that name; else,
+ * on a Linux host, its number (Node's negative `errno`), the same as the
+ * guest's; else EIO. A RangeError is a malformed request's, EINVAL.
+ */
+function errno_of(error: unknown): number {
+  if (error instanceof FSError) return error.errno;
+  if (error instanceof RangeError) return Errno.EINVAL;
+  const { code, errno } = (error ?? {}) as { code?: unknown; errno?: unknown };
+  if (typeof code === "string" && Object.hasOwn(Errno, code)) {
+    return Errno[code as FSErrorCode];
+  }
+  const linux = (globalThis as { process?: { platform?: string } }).process?.platform === "linux";
+  if (linux && typeof errno === "number" && errno < 0 && errno > -4096) return -errno;
+  return Errno.EIO;
+}
 
 /** An expected filesystem failure which should be returned to the guest. */
 export class FSError extends Error {
@@ -1246,14 +1293,9 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           continue;
         }
         const response = new Bytes(FuseOutHeader.size);
-        // Malformed requests are EINVAL; RangeError comes from the Reader
-        // bounds checks and is the same class of protocol error.
-        const errno =
-          error instanceof FSError
-            ? error.errno
-            : error instanceof RangeError
-              ? Errno.EINVAL
-              : Errno.EIO;
+        // Malformed requests are EINVAL (RangeError comes from the Reader
+        // bounds checks); a host error keeps its errno (errno_of).
+        const errno = errno_of(error);
         response.alloc(FuseOutHeader).value = {
           len: FuseOutHeader.size,
           error: -errno,
