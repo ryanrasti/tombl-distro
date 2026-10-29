@@ -17,9 +17,25 @@ const Opcode = {
   LINK: 13,
   FSYNCDIR: 30,
   FALLOCATE: 43,
+  READDIRPLUS: 44,
   RENAME2: 45,
   SYNCFS: 50,
 } as const;
+
+/** The (name, nodeid, ino) of each entry in a READDIRPLUS reply. */
+function direntsplus(payload: Uint8Array) {
+  const result: [string, bigint, bigint][] = [];
+  const data = view(payload);
+  for (let at = 0; at < payload.byteLength; ) {
+    const nodeid = data.getBigUint64(at, true);
+    const dirent = at + 128;
+    const length = data.getUint32(dirent + 16, true);
+    const name = new TextDecoder().decode(payload.subarray(dirent + 24, dirent + 24 + length));
+    result.push([name, nodeid, data.getBigUint64(dirent, true)]);
+    at = dirent + ((24 + length + 7) & ~7);
+  }
+  return result;
+}
 
 const view = (bytes: Uint8Array) => new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 const getattr_in = () => body(["u32", 0], ["u32", 0], ["u64", 0n]);
@@ -239,5 +255,59 @@ test("virtio-fs serves hard links, mknod, rename flags, fallocate, syncfs and fs
     ["syncfs"],
     ["fsyncdir", "dir"],
   ]);
+  await harness.close();
+});
+
+test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what it has on an error", async () => {
+  const nodes = { a: { name: "a" }, b: { name: "b" }, gone: { name: "gone" }, bad: { name: "bad" } };
+  const forgotten: object[] = [];
+  let names = ["a", "gone", "b"];
+  const harness = new FuseHarness(
+    filesystem({
+      getattr: () => ({ ...directory, ino: 5n }),
+      entry: (_parent, name) => {
+        if (name === "gone") return undefined;
+        if (name === "bad") throw new FSError("EACCES");
+        const node = nodes[name as keyof typeof nodes];
+        return { node, attributes: { mode: 0o100644, size: 0n, ino: name === "a" ? 10n : 11n } };
+      },
+      opendir: () => "dir",
+      readdir: () => names.map((name) => ({ name, node: nodes[name as keyof typeof nodes] })),
+      forget: (node) => void forgotten.push(node),
+    }),
+  );
+  await harness.request(Opcode.GETATTR, ROOT, getattr_in());
+  const dir = view((await harness.request(Opcode.OPENDIR, ROOT, open_in())).payload).getBigUint64(0, true);
+
+  const listing = await harness.request(Opcode.READDIRPLUS, ROOT, read_in(dir, 0n, 4096));
+  assert.equal(listing.error, 0);
+  const entries = direntsplus(listing.payload);
+  assert.deepEqual(
+    entries.map(([name, nodeid, ino]) => [name, nodeid === 0n, ino]),
+    [
+      [".", true, 5n],
+      ["..", true, 5n],
+      ["a", false, 10n],
+      ["b", false, 11n],
+    ],
+  );
+  // "gone", never returned, was dropped at once; each entry returned was a
+  // lookup, kept till the guest forgets it.
+  assert.deepEqual(forgotten, [nodes.gone]);
+  const a = entries[2]![1];
+  await harness.request(Opcode.FORGET, a, body(["u64", 1n]));
+  assert.deepEqual(forgotten, [nodes.gone, nodes.a]);
+
+  // An error after an entry: the reply keeps what it has. First, a fresh listing.
+  names = ["a", "bad", "b"];
+  const partial = await harness.request(Opcode.READDIRPLUS, ROOT, read_in(dir, 0n, 4096));
+  assert.equal(partial.error, 0);
+  assert.deepEqual(
+    direntsplus(partial.payload).map(([name]) => name),
+    [".", "..", "a"],
+  );
+  // The same error with nothing yet written fails the request.
+  const failed = await harness.request(Opcode.READDIRPLUS, ROOT, read_in(dir, 3n, 4096));
+  assert.equal(failed.error, -13);
   await harness.close();
 });

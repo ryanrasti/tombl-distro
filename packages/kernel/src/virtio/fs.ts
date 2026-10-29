@@ -44,6 +44,7 @@ const FuseOpcode = {
   DESTROY: 38,
   BATCH_FORGET: 42,
   FALLOCATE: 43,
+  READDIRPLUS: 44,
   RENAME2: 45,
   SYNCFS: 50,
 } as const;
@@ -53,6 +54,8 @@ const FuseInitFlags = {
   ATOMIC_O_TRUNC: 1 << 3,
   BIG_WRITES: 1 << 5,
   AUTO_INVAL_DATA: 1 << 12,
+  DO_READDIRPLUS: 1 << 13,
+  READDIRPLUS_AUTO: 1 << 14,
   PARALLEL_DIROPS: 1 << 18,
   MAX_PAGES: 1 << 22,
   CACHE_SYMLINKS: 1 << 23,
@@ -1044,6 +1047,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           FuseInitFlags.ATOMIC_O_TRUNC |
           FuseInitFlags.BIG_WRITES |
           FuseInitFlags.AUTO_INVAL_DATA |
+          FuseInitFlags.DO_READDIRPLUS |
+          FuseInitFlags.READDIRPLUS_AUTO |
           FuseInitFlags.PARALLEL_DIROPS |
           FuseInitFlags.MAX_PAGES |
           FuseInitFlags.CACHE_SYMLINKS |
@@ -1348,8 +1353,12 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         remove_handle(request.fh, handle);
         break;
       }
-      case FuseOpcode.READDIR: {
+      case FuseOpcode.READDIR:
+      case FuseOpcode.READDIRPLUS: {
         if (!filesystem.readdir) throw new UnsupportedOperation();
+        // READDIRPLUS: each entry with its node and attributes, as a lookup
+        // would give them, and counted as one by the guest.
+        const plus = header.opcode === FuseOpcode.READDIRPLUS;
         const request = body.struct(FuseReadIn);
         const offset = checked_number(request.offset);
         const handle = handle_record(request.fh, true, node!);
@@ -1389,10 +1398,41 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           for (let index = offset; index < listed.length + 2; index++) {
             const entry = entry_at(index);
             const name = utf8_encoder.encode(entry.name);
-            // FUSE dirents are padded to 8 bytes: 24-byte header + name.
-            const record_length = (24 + name.byteLength + 7) & ~7;
+            // FUSE dirents are padded to 8 bytes: 24-byte header + name, after
+            // READDIRPLUS's entry. Checked before looking an entry up: each
+            // one returned is a lookup the guest will forget.
+            const record_length = ((plus ? FuseEntryOut.size : 0) + 24 + name.byteLength + 7) & ~7;
             if (payload.length + record_length > limit) break;
-            const mode = entry.mode ?? (await filesystem.getattr(entry.record.node)).mode;
+            let mode = entry.mode;
+            if (plus && index < 2) {
+              // "." and "..": no entry (nodeid 0), as the guest takes them so.
+              payload.bump(FuseEntryOut.size);
+              mode = FileType.directory;
+            } else if (plus) {
+              let attributes: FSAttributes;
+              try {
+                attributes =
+                  entry.attributes ??
+                  (filesystem.entry
+                    ? ((await filesystem.entry(handle.node.node, entry.name))?.attributes ??
+                      (() => {
+                        throw new FSError("ENOENT");
+                      })())
+                    : await filesystem.getattr(entry.record.node));
+              } catch (error) {
+                // Gone since the listing: left out. Anything else ends the
+                // reply with what it has (whose lookups count), failing only
+                // an empty one, as virtiofsd's.
+                const errno = errno_of(error);
+                if (errno === Errno.ENOENT || errno === Errno.ESTALE) continue;
+                if (payload.length > 0) break;
+                throw error;
+              }
+              entry.record.lookups += 1n;
+              write_entry(payload, entry.record, attributes, validity);
+              mode = attributes.mode;
+            }
+            mode ??= (await filesystem.getattr(entry.record.node)).mode;
             payload.alloc(FuseDirent).value = {
               ino: entry.attributes?.ino ?? entry.record.ino ?? entry.record.id,
               off: BigInt(index + 1),
