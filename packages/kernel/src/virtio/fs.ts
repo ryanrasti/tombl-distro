@@ -62,6 +62,9 @@ const FUSE_MINIMUM_MINOR = 27;
 /** A request's most pages: 1 MiB at 4 KiB pages. */
 const MAX_PAGES = 256;
 
+/** fuse_open_out's open_flags: keep the file's page cache across opens. */
+const FOPEN_KEEP_CACHE = 1 << 1;
+
 const FuseGetattrFlags = {
   FH: 1 << 0,
 } as const;
@@ -200,6 +203,12 @@ export interface FSAttributes {
   gid?: number;
   rdev?: number;
   blockSize?: number;
+  /**
+   * The inode number the guest sees, stable for as long as the file is
+   * (a host file's own, say). Without it, the device's id for the node,
+   * which changes when the guest forgets the node and looks it up again.
+   */
+  ino?: bigint;
 }
 
 export interface FSSetAttributes {
@@ -217,6 +226,14 @@ export interface FSDirectoryEntry<TNode> {
   node: TNode;
   /** The entry's file type (its mode's type bits), if known: else the device asks getattr. */
   mode?: number;
+  /** The entry's attributes, if the listing has them: its mode and inode number then come from them. */
+  attributes?: FSAttributes;
+}
+
+/** A name's node and its attributes, together. */
+export interface FSEntry<TNode> {
+  node: TNode;
+  attributes: FSAttributes;
 }
 
 export interface FSStat {
@@ -249,7 +266,25 @@ export interface FSCreateContext {
  */
 export interface FS<TNode, THandle> {
   readonly root: TNode;
+  /**
+   * How long the guest may cache names and attributes, in seconds: a
+   * read-only store's can be long. Without it, the device's `cache` option.
+   */
+  readonly timeout?: number;
+  /** Keep the guest's page cache of a file across opens (FOPEN_KEEP_CACHE): for files that don't change. */
+  readonly keepCache?: boolean;
   lookup(parent: TNode, name: string): MaybePromise<TNode | undefined>;
+  /**
+   * A name's node with its attributes, if the backend gets both at once: the
+   * device then uses it for lookups instead of lookup and a getattr.
+   */
+  entry?(parent: TNode, name: string): MaybePromise<FSEntry<TNode> | undefined>;
+  /**
+   * The guest has forgotten a node: no lookup, open handle or child of it is
+   * left. A backend may drop what it keeps for the node; a later lookup of
+   * the same file may return a new node.
+   */
+  forget?(node: TNode): void;
   getattr(node: TNode, handle?: THandle): MaybePromise<FSAttributes>;
   setattr?(node: TNode, attributes: FSSetAttributes, handle?: THandle): MaybePromise<FSAttributes>;
   readlink?(node: TNode): MaybePromise<string>;
@@ -542,6 +577,8 @@ class UnsupportedOperation extends FSError {
 
 interface NodeRecord<TNode> {
   id: bigint;
+  /** The inode number its attributes last gave (FSAttributes.ino), for "." and "..". */
+  ino?: bigint;
   node: TNode;
   parent: NodeRecord<TNode>;
   lookups: bigint;
@@ -554,7 +591,7 @@ interface HandleRecord<TNode, THandle> {
   handle: THandle;
   directory: boolean;
   /** A directory's entries, read by its first READDIR and resumed by `off`. */
-  entries?: { name: string; node: TNode; mode?: number }[];
+  entries?: { name: string; node: TNode; mode?: number; attributes?: FSAttributes }[];
 }
 
 function mode_type(mode: number): keyof typeof DirentType {
@@ -676,12 +713,13 @@ function timestamp(value: FSTimestamp | undefined): [bigint, number] {
 }
 
 /** The `struct fuse_attr` value for a node, derived from `FSAttributes`. */
-function attr_fields(nodeid: bigint, attributes: FSAttributes) {
+function attr_fields(record: NodeRecord<unknown>, attributes: FSAttributes) {
   const [atime, atimensec] = timestamp(attributes.atime);
   const [mtime, mtimensec] = timestamp(attributes.mtime);
   const [ctime, ctimensec] = timestamp(attributes.ctime);
+  if (attributes.ino !== undefined) record.ino = attributes.ino;
   return {
-    ino: nodeid,
+    ino: attributes.ino ?? record.id,
     size: attributes.size,
     blocks: attributes.blocks ?? (attributes.size + 511n) / 512n,
     atime,
@@ -713,21 +751,21 @@ function write_entry<TNode>(
     attr_valid: validity,
     entry_valid_nsec: 0,
     attr_valid_nsec: 0,
-    attr: attr_fields(record.id, attributes),
+    attr: attr_fields(record, attributes),
   };
 }
 
 function write_attr_out(
   payload: Bytes,
   validity: bigint,
-  nodeid: bigint,
+  record: NodeRecord<unknown>,
   attributes: FSAttributes,
 ) {
   payload.alloc(FuseAttrOut).value = {
     attr_valid: validity,
     attr_valid_nsec: 0,
     dummy: 0,
-    attr: attr_fields(nodeid, attributes),
+    attr: attr_fields(record, attributes),
   };
 }
 
@@ -762,7 +800,13 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
   options: FSDeviceOptions,
 ): Device {
   const { tag, cache = true, pageSize = 4096 } = options;
-  const validity = cache ? 1n : 0n;
+  const validity =
+    filesystem.timeout !== undefined
+      ? BigInt(Math.max(0, Math.floor(filesystem.timeout)))
+      : cache
+        ? 1n
+        : 0n;
+  const open_flags = filesystem.keepCache ? FOPEN_KEEP_CACHE : 0;
   const encoded_tag = utf8_encoder.encode(tag);
   if (encoded_tag.byteLength === 0 || encoded_tag.byteLength > 36) {
     throw new RangeError("virtio-fs tag must be between 1 and 36 UTF-8 bytes");
@@ -825,6 +869,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
       records.delete(record.id);
       by_node.delete(record.node);
       record.parent.children -= 1;
+      filesystem.forget?.(record.node);
       collect_record(record.parent);
     }
   }
@@ -899,12 +944,23 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     return finalize_promise;
   }
 
+  /** A name's record, one more lookup of it, and its attributes. */
   async function lookup(parent: NodeRecord<TNode>, name: string) {
-    const node = await filesystem.lookup(parent.node, validate_name(name));
+    validate_name(name);
+    let node: TNode | undefined;
+    let attributes: FSAttributes | undefined;
+    if (filesystem.entry) {
+      const found = await filesystem.entry(parent.node, name);
+      node = found?.node;
+      attributes = found?.attributes;
+    } else {
+      node = await filesystem.lookup(parent.node, name);
+    }
     if (!node) throw new FSError("ENOENT");
+    attributes ??= await filesystem.getattr(node);
     const record = record_for_node(node, parent);
     record.lookups += 1n;
-    return record;
+    return { record, attributes };
   }
 
   async function process(header: FuseInHeaderValue, body: Reader, capacity: number) {
@@ -954,8 +1010,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         break;
       }
       case FuseOpcode.LOOKUP: {
-        const record = await lookup(node!, body.cstring());
-        write_entry(payload, record, await filesystem.getattr(record.node), validity);
+        const { record, attributes } = await lookup(node!, body.cstring());
+        write_entry(payload, record, attributes, validity);
         break;
       }
       case FuseOpcode.FORGET: {
@@ -980,7 +1036,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           request.getattr_flags & FuseGetattrFlags.FH
             ? handle_record(request.fh, undefined, node!).handle
             : undefined;
-        write_attr_out(payload, validity, node!.id, await filesystem.getattr(node!.node, handle));
+        write_attr_out(payload, validity, node!, await filesystem.getattr(node!.node, handle));
         break;
       }
       case FuseOpcode.SETATTR: {
@@ -1011,7 +1067,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
             ? handle_record(request.fh, undefined, node!).handle
             : undefined;
         const attributes = await filesystem.setattr(node!.node, changes, open);
-        write_attr_out(payload, validity, node!.id, attributes);
+        write_attr_out(payload, validity, node!, attributes);
         break;
       }
       case FuseOpcode.READLINK: {
@@ -1086,10 +1142,11 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         const handle = await method.call(filesystem, node!.node, request.flags);
         payload.alloc(FuseOpenOut).value = {
           fh: add_handle(node!, handle, directory),
-          // Keep open flags zero even when cache is false. Cache controls only
-          // entry/attribute validity; FOPEN_DIRECT_IO would route private
+          // Never FOPEN_DIRECT_IO, even when cache is false: cache controls
+          // only entry/attribute validity, and direct I/O would route private
           // owner-worker user buffers through unsupported page extraction.
-          open_flags: 0,
+          // A backend's unchanging files keep their page cache.
+          open_flags: directory ? 0 : open_flags,
           backing_id: -1,
         };
         break;
@@ -1111,7 +1168,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           // CREATE returns the same open flags as OPEN; direct I/O is
           // unsupported by this wasm transport even when metadata/name
           // validity is zero.
-          open_flags: 0,
+          open_flags,
           backing_id: -1,
         };
         break;
@@ -1194,7 +1251,12 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           handle.entries = [];
           const directory_entries = await filesystem.readdir(handle.node.node, handle.handle);
           for (const entry of await async_iterable(directory_entries)) {
-            handle.entries.push({ name: validate_name(entry.name), node: entry.node, mode: entry.mode });
+            handle.entries.push({
+              name: validate_name(entry.name),
+              node: entry.node,
+              mode: entry.attributes?.mode ?? entry.mode,
+              attributes: entry.attributes,
+            });
           }
         }
         const listed = handle.entries;
@@ -1205,11 +1267,11 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         const transient: NodeRecord<TNode>[] = [];
         const limit = Math.min(request.size, capacity - FuseOutHeader.size);
         const entry_at = (index: number) => {
-          if (index < 2) return { ...entries[index]!, mode: undefined };
-          const { name, node, mode } = listed[index - 2]!;
+          if (index < 2) return { ...entries[index]!, mode: undefined, attributes: undefined };
+          const { name, node, mode, attributes } = listed[index - 2]!;
           const record = record_for_node(node, handle.node);
           transient.push(record);
-          return { name, record, mode };
+          return { name, record, mode, attributes };
         };
         try {
           for (let index = offset; index < listed.length + 2; index++) {
@@ -1220,7 +1282,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
             if (payload.length + record_length > limit) break;
             const mode = entry.mode ?? (await filesystem.getattr(entry.record.node)).mode;
             payload.alloc(FuseDirent).value = {
-              ino: entry.record.id,
+              ino: entry.attributes?.ino ?? entry.record.ino ?? entry.record.id,
               off: BigInt(index + 1),
               namelen: name.byteLength,
               type: DirentType[mode_type(mode)],
