@@ -866,13 +866,17 @@ export class NodeFS implements FS<Node, Handle> {
    * open file closed and every node forgotten, as virtiofsd's destroy.
    */
   async destroy() {
+    // Everything open closed first: the share may be gone by now (a machine
+    // ending after its directory was removed), which mustn't keep them open.
     const files = [...this.#open].flatMap((handle) => (handle.file ? [handle.file] : []));
     this.#open.clear();
+    await Promise.all(files.map((file) => file.close().catch(() => {})));
     this.#by_key.clear();
     this.#by_path.clear();
     this.#children.clear();
     this.root.paths.clear();
-    this.#adopt_root(await node_call(lstat(this.rootPath, { bigint: true })));
-    await Promise.all(files.map((file) => file.close().catch(() => {})));
+    // Known again by its path if it's still there; else every later use is ESTALE.
+    const stats = await lstat(this.rootPath, { bigint: true }).catch(() => null);
+    if (stats) this.#adopt_root(stats);
   }
 }

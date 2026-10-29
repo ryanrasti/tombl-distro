@@ -550,3 +550,16 @@ test("node virtio-fs adapter caches long when read-only", async () => {
   assert.equal(new NodeFS(share, { readOnly: true }).timeout, 3600);
   assert.equal(new NodeFS(share, { timeout: 5 }).timeout, 5);
 });
+
+test("node virtio-fs adapter closes everything at destroy even once the share is gone", async () => {
+  const { directory, share } = await fresh();
+  const filesystem = new NodeFS(share);
+  const file = await node_at(filesystem, "file");
+  const handle = await filesystem.open!(file, linux_open.readonly);
+  const listing = await filesystem.opendir!(filesystem.root, 0);
+  await rm(directory, { recursive: true, force: true });
+  await filesystem.destroy!();
+  await assert.rejects(filesystem.read!(file, handle, 0n, 1), errno(9));
+  await assert.rejects(filesystem.readdir!(filesystem.root, listing), errno(116));
+  await assert.rejects(filesystem.lookup(filesystem.root, "file"), errno(116));
+});
