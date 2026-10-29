@@ -551,17 +551,25 @@ function concatenate(buffers: readonly VirtqueueBuffer[], writable: boolean) {
   return result;
 }
 
-function scatter(buffers: readonly VirtqueueBuffer[], data: Uint8Array) {
-  let offset = 0;
-  for (const buffer of buffers) {
-    if (!buffer.writable) continue;
-    const length = Math.min(buffer.array.byteLength, data.byteLength - offset);
-    if (length <= 0) break;
-    buffer.array.set(data.subarray(offset, offset + length));
-    offset += length;
-  }
-  if (offset !== data.byteLength) {
-    throw new Error("guest response buffers are too small");
+/** Writes `parts`, one after another, across the chain's writable buffers. */
+function scatter(buffers: readonly VirtqueueBuffer[], ...parts: Uint8Array[]) {
+  const writable = buffers.filter((buffer) => buffer.writable);
+  let index = 0;
+  let at = 0;
+  for (const data of parts) {
+    let offset = 0;
+    while (offset < data.byteLength) {
+      const buffer = writable[index];
+      if (!buffer) throw new Error("guest response buffers are too small");
+      const length = Math.min(buffer.array.byteLength - at, data.byteLength - offset);
+      buffer.array.set(data.subarray(offset, offset + length), at);
+      offset += length;
+      at += length;
+      if (at === buffer.array.byteLength) {
+        index += 1;
+        at = 0;
+      }
+    }
   }
 }
 
@@ -837,7 +845,9 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
   }
 
   async function process(header: FuseInHeaderValue, body: Reader, capacity: number) {
-    const payload = new Bytes(Math.max(0, capacity - FuseOutHeader.size));
+    // (grown as written: allocating the guest's whole response capacity, a
+    // zeroed array per request, was most of a small request's cost)
+    const payload = new Bytes();
     const node = header.nodeid === 0n ? undefined : node_record(header.nodeid);
 
     switch (header.opcode) {
@@ -1051,8 +1061,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         if (data.byteLength > request.size || data.byteLength > capacity - FuseOutHeader.size) {
           throw new FSError("EIO", "filesystem returned too much data");
         }
-        payload.append(data);
-        break;
+        // The data itself is the reply's payload, written to the guest as is.
+        return data;
       }
       case FuseOpcode.WRITE: {
         if (!filesystem.write) throw new UnsupportedOperation();
@@ -1187,7 +1197,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     if (payload.length > capacity - FuseOutHeader.size) {
       throw new FSError("EIO", "response exceeds the guest's response buffer");
     }
-    return payload;
+    return payload.array;
   }
 
   async function notify(queue: Virtqueue) {
@@ -1220,15 +1230,16 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           chain.release(0);
           continue;
         }
-        const response = new Bytes(FuseOutHeader.size + payload.length);
+        const response = new Bytes(FuseOutHeader.size);
         response.alloc(FuseOutHeader).value = {
-          len: FuseOutHeader.size + payload.length,
+          len: FuseOutHeader.size + payload.byteLength,
           error: 0,
           unique,
         };
-        response.append(payload.array);
-        scatter(buffers, response.array);
-        chain.release(response.array.byteLength);
+        // The header and payload go to the guest's buffers as they are,
+        // without first being joined into one response.
+        scatter(buffers, response.array, payload);
+        chain.release(FuseOutHeader.size + payload.byteLength);
       } catch (error) {
         if (capacity < FuseOutHeader.size) {
           chain.release(0);
@@ -1267,7 +1278,9 @@ class FileSystemDevice extends VirtioDevice {
     finalize: () => Promise<void>,
   ) {
     // 26 is the virtio-fs device ID: a high-priority queue and one request queue.
-    super({ id: 26, queues: 2, config });
+    // Views: requests are read and replies written in guest memory itself,
+    // not in copies written back at release. Reset waits for kicks in flight.
+    super({ id: 26, queues: 2, config, views: true });
     this.#notify = notify;
     this.#finalize = finalize;
   }
