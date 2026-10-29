@@ -166,7 +166,9 @@ export const MachineTerminationReason = {
 export type MachineTerminationReason =
   (typeof MachineTerminationReason)[keyof typeof MachineTerminationReason];
 
-export interface Imports {
+// (a type, not an interface: an implicit index signature, so a host can
+// pass its tables as WebAssembly.ModuleImports without a cast)
+export type Imports = {
   env: { memory: WebAssembly.Memory };
   boot: {
     get_devicetree(buf: number, size: number): number;
@@ -227,7 +229,7 @@ export interface Imports {
 
     notify(dev: number, vq: number): void;
   };
-}
+};
 
 export const HALT_KERNEL = Symbol("halt kernel");
 
