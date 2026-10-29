@@ -177,6 +177,8 @@ function create_remote_device(endpoint: Endpoint, ready: ReadyMessage): Device {
     features: ready.features,
     config,
     queues: ready.queues,
+    // (the default: a remote device's own isn't carried over yet)
+    queue_size: 256,
     closed: close_completion.promise,
     attach(context) {
       assert(!connection, "remote virtio device is already attached");

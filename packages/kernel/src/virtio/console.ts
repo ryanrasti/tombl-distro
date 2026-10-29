@@ -39,7 +39,7 @@ class VirtioConsole extends VirtioDevice {
 
   constructor(input: ReadableStream<Uint8Array> | null, output: WritableStream<Uint8Array> | null) {
     const config = new Uint8Array(ConsoleConfig.size);
-    super({ id: 3, queues: 2, features: Features.SIZE, config });
+    super({ id: 3, queues: 2, features: Features.SIZE, config, queue_size: 16 });
     this.#size = new ConsoleConfig(config);
     this.#size.columns = 80;
     this.#size.rows = 24;

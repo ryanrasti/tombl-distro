@@ -55,6 +55,8 @@ export interface BusDevice {
   readonly features: bigint;
   readonly config: Uint8Array;
   readonly queues: number;
+  /** The most descriptors each of its queues takes (virtio's queue_num_max). */
+  readonly queue_size: number;
   readonly closed: Promise<void>;
   attach(context: VirtioConnectionContext): ConnectedVirtioDevice;
   /** Idempotently stops the device and releases its backend. */
@@ -92,6 +94,12 @@ export interface VirtioDeviceOptions {
   /** The device's configuration space, at most 256 bytes. */
   config?: Uint8Array;
   /**
+   * The most descriptors each queue takes (256 if not given). A guest fills
+   * a receive queue at probe, a buffer a descriptor: a device that receives
+   * little (a console) needs few.
+   */
+  queue_size?: number;
+  /**
    * Present descriptors as views of guest memory instead of copies. A guest
    * reset then waits for the device's kicks and spawned work in flight, so
    * that work must stop touching its views when it settles.
@@ -113,6 +121,7 @@ export abstract class VirtioDevice implements BusDevice {
   /** Mutate in place, then call `update_config()`. Its size is fixed. */
   readonly config: Uint8Array;
   readonly queues: number;
+  readonly queue_size: number;
   readonly closed: Promise<void>;
 
   #closed = Promise.withResolvers<void>();
@@ -128,11 +137,13 @@ export abstract class VirtioDevice implements BusDevice {
     queues,
     features = 0n,
     config = new Uint8Array(),
+    queue_size = 256,
     views = false,
   }: VirtioDeviceOptions) {
     this.id = id;
     this.#views = views;
     this.queues = queues;
+    this.queue_size = queue_size;
     this.features =
       TransportFeatures.VERSION_1 |
       TransportFeatures.RING_PACKED |

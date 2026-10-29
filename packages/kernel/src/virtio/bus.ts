@@ -24,6 +24,7 @@ export class VirtioBus {
           "virtio-device-id": device.id,
           features: device.features,
           config: device.config,
+          "queue-size": device.queue_size,
         },
       ]),
     );
