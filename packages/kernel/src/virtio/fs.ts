@@ -45,11 +45,22 @@ const FuseOpcode = {
 
 const FuseInitFlags = {
   ASYNC_READ: 1 << 0,
+  ATOMIC_O_TRUNC: 1 << 3,
   BIG_WRITES: 1 << 5,
   AUTO_INVAL_DATA: 1 << 12,
+  PARALLEL_DIROPS: 1 << 18,
   MAX_PAGES: 1 << 22,
+  CACHE_SYMLINKS: 1 << 23,
   INIT_EXT: 1 << 30,
 } as const;
+
+/** The protocol version this device speaks, and the oldest minor it takes. */
+const FUSE_MAJOR = 7;
+const FUSE_MINOR = 45;
+const FUSE_MINIMUM_MINOR = 27;
+
+/** A request's most pages: 1 MiB at 4 KiB pages. */
+const MAX_PAGES = 256;
 
 const FuseGetattrFlags = {
   FH: 1 << 0,
@@ -288,6 +299,11 @@ export interface FSDeviceOptions {
    * disable the guest data page cache and does not provide direct I/O.
    */
   cache?: boolean;
+  /**
+   * The guest's page size, in bytes (default 4096). A request carries at
+   * most 256 pages, so reads and writes of 1 MiB at 4 KiB pages.
+   */
+  pageSize?: number;
 }
 
 // The FUSE request and response structs, mirroring include/uapi/linux/fuse.h.
@@ -745,7 +761,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
   filesystem: T & RequiresDurability<T>,
   options: FSDeviceOptions,
 ): Device {
-  const { tag, cache = true } = options;
+  const { tag, cache = true, pageSize = 4096 } = options;
   const validity = cache ? 1n : 0n;
   const encoded_tag = utf8_encoder.encode(tag);
   if (encoded_tag.byteLength === 0 || encoded_tag.byteLength > 36) {
@@ -900,30 +916,35 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     switch (header.opcode) {
       case FuseOpcode.INIT: {
         const init = body.struct(FuseInitIn);
-        if (init.major !== 7) {
-          if (init.major < 7) throw new FSError("EPROTO");
+        if (init.major !== FUSE_MAJOR) {
+          if (init.major < FUSE_MAJOR) throw new FSError("EPROTO");
           // A newer kernel retries with our major; only major and minor reply.
-          payload.alloc(U32LE).value = 7;
-          payload.alloc(U32LE).value = 45;
+          payload.alloc(U32LE).value = FUSE_MAJOR;
+          payload.alloc(U32LE).value = FUSE_MINOR;
           break;
         }
+        // Older minors lack replies this device's structs assume.
+        if (init.minor < FUSE_MINIMUM_MINOR) throw new FSError("EPROTO");
         const supported_flags =
           FuseInitFlags.ASYNC_READ |
+          FuseInitFlags.ATOMIC_O_TRUNC |
           FuseInitFlags.BIG_WRITES |
           FuseInitFlags.AUTO_INVAL_DATA |
+          FuseInitFlags.PARALLEL_DIROPS |
           FuseInitFlags.MAX_PAGES |
+          FuseInitFlags.CACHE_SYMLINKS |
           FuseInitFlags.INIT_EXT;
         const flags = init.flags & supported_flags;
         payload.alloc(FuseInitOut).value = {
-          major: 7,
-          minor: Math.min(init.minor, 45),
+          major: FUSE_MAJOR,
+          minor: Math.min(init.minor, FUSE_MINOR),
           max_readahead: Math.min(init.max_readahead, 1024 * 1024),
           flags,
           max_background: 12,
           congestion_threshold: 9,
-          max_write: 1024 * 1024,
+          max_write: MAX_PAGES * pageSize,
           time_gran: 1,
-          max_pages: (flags & FuseInitFlags.MAX_PAGES) === 0 ? 0 : 16,
+          max_pages: (flags & FuseInitFlags.MAX_PAGES) === 0 ? 0 : MAX_PAGES,
           map_alignment: 0,
           flags2: 0,
           max_stack_depth: 0,

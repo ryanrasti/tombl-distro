@@ -8,7 +8,12 @@ import { body, FuseHarness } from "./fs-fixture.ts";
 const Opcode = {
   LOOKUP: 1,
   GETATTR: 3,
+  INIT: 26,
 } as const;
+
+/** INIT's request: version, readahead, and flags (MAX_PAGES and the rest). */
+const init = (major: number, minor: number, flags = 0xffff_ffff) =>
+  body(["u32", major], ["u32", minor], ["u32", 1 << 20], ["u32", flags]);
 
 const ROOT = 1n;
 
@@ -47,5 +52,30 @@ test("virtio-fs gives the guest a backend error's Linux errno", async () => {
     thrown = Object.assign(new Error("odd"), { code: "EWHATEVER", errno: -72 });
     assert.equal((await getattr()).error, -72);
   }
+  await harness.close();
+});
+
+test("virtio-fs INIT takes minors from 27 and offers 1 MiB requests", async () => {
+  const harness = new FuseHarness(filesystem());
+  assert.equal((await harness.request(Opcode.INIT, 0n, init(7, 26))).error, -71);
+  assert.equal((await harness.request(Opcode.INIT, 0n, init(6, 40))).error, -71);
+
+  const newer = await harness.request(Opcode.INIT, 0n, init(8, 0));
+  assert.equal(newer.error, 0);
+  const offered = new DataView(newer.payload.buffer);
+  assert.deepEqual([offered.getUint32(0, true), offered.getUint32(4, true)], [7, 45]);
+
+  const reply = await harness.request(Opcode.INIT, 0n, init(7, 45));
+  assert.equal(reply.error, 0);
+  const out = new DataView(reply.payload.buffer);
+  assert.equal(out.getUint32(20, true), 1024 * 1024, "max_write");
+  assert.equal(out.getUint16(28, true), 256, "max_pages");
+  await harness.close();
+});
+
+test("virtio-fs INIT sizes requests by the guest's page size", async () => {
+  const harness = new FuseHarness(filesystem(), { pageSize: 65536 });
+  const out = new DataView((await harness.request(Opcode.INIT, 0n, init(7, 45))).payload.buffer);
+  assert.equal(out.getUint32(20, true), 256 * 65536, "max_write");
   await harness.close();
 });
