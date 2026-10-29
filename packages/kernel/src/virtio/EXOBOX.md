@@ -28,6 +28,8 @@ harness (the Appendix has the conditions).
 | `d443d51` | `link`, `mknod`, renameat2's flags, `fallocate`, `syncfs`, `fsyncdir` | ENOSYS before: no hard links, `mkfifo`, `mv -n`, `posix_fallocate`, or `sync` reaching the backend |
 | `88e8d69` | `READDIRPLUS` | `ls -l` was a `READDIR`, then a `LOOKUP` and a `GETATTR` an entry: 2,957 lookups and 3,455 getattrs for a 2,700-file tree, against 557 requests |
 | `5e5f34a` | `FSError.from` (the device's own mapping, for backends), numeric `FSError`s, `FSEntry` exported | for NodeFS, and any backend, to throw what the device would give |
+| `19f3f37` | a host counts a request's work (`VirtioConnectionContext.host_work`, any device's), each request through it till its reply is written; a queue's one request at a time documented in `notify` | exobox's host turns its event loop more often while the guest waits on host work: without it, a filesystem request waited for a time slice's turn |
+| `4a805ce` | `Imports` a type, not an interface | an interface has no implicit index signature, so a host cast its tables to pass them as `WebAssembly.ModuleImports` |
 
 **The transport (`bus.ts`, `device.ts`, `remote.ts`, `console.ts`)**
 
