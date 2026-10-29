@@ -72,6 +72,94 @@ Its tests are in `packages/linux-guest/tests/virtio-fs-node.test.ts`; the
 device's, driven through its request queue with no guest, in
 `packages/kernel/test/virtio-fs.test.ts`.
 
+## How exobox uses it
+
+- **The parts:** the guest's kernel runs Linux's own `virtio_fs` driver
+  (stock), over this repo's virtio transport (`bus.ts`, `device.ts`, with
+  the queue size and reset changes above; the kernel side of the reset is
+  ryanrasti/linux's `7a6043bf`, `7fc646b7`). This device is the one FUSE
+  server; its filesystems are `NodeFS` for host directories (a mount, or
+  the host's `/nix/store`) and linux-workers' `PackageStore` for its
+  package store. linux-workers gives a machine one device a tag
+  (`fileSystemDevice(fs, { tag })`); stage 1 mounts each with
+  `mount -t virtiofs TAG DIR`.
+- **One request at a time per queue:** a filesystem sees a queue's
+  requests one after another (`notify`'s comment); a slow one holds up its
+  filesystem, not the machine. Each is the host's work (`host_work`) until
+  its reply is written, so exobox's event loop turns sooner meanwhile.
+- **A second mount of a tag** is the first's connection again: `virtio_fs`
+  gives it the same superblock, so no two connections serve a filesystem.
+- **Around the device, exobox's own** (linux-workers' `src/node/machine.ts`,
+  stated precisely in its `docs/internals.md`): no two host directories
+  served writable may overlap, refused at boot across every machine in the
+  process by real path, so a guest can't race NodeFS's checks through two
+  mounts. As a machine ends, each device is shut down (`shutdown`: no more
+  requests, the one in progress settled, then every handle released and
+  the filesystem's `destroy`).
+- **Limits:**
+  - Node has no `openat` or `O_PATH`, so NodeFS reaches files by path,
+    checked at each use. A host process changing the share at the same
+    moment isn't covered, and an unlinked file can't be reopened (its
+    header has the model);
+  - `RENAME_NOREPLACE` isn't atomic; `syncfs` syncs open files only;
+    `fallocate` reserves space as it's written; timestamps are as precise
+    as Node's `utimes` (and "now" its milliseconds); a listing `lstat`s
+    each entry (Node's `Dirent` has no inode);
+  - running as root without `owner`, a guest's `chown` reaches the host's
+    owners; setuid and setgid bits are masked unless `setuid` allows them;
+    `maxOpen` files at most (EMFILE past it);
+  - shared `mmap` of these files is a copy, written back at `msync`,
+    `munmap`, `fsync`, exec and exit (exobox's kernel keeps mappings), as
+    of every file in its machines.
+- **The plan:** virtiofsd's Rust passthrough behind a Node addon on Linux
+  hosts: a descriptor per node, which closes the path-race class; NodeFS
+  stays the fallback elsewhere.
+
+## What hostfuse was
+
+Until October 29, 2026, exobox served host directories with its own FUSE
+transport: `hostfuse`, a kernel driver (`arch/wasm/exobox/hostfuse.c`,
+modelled on `virtio_fs.c`, without virtqueues: each request handed to the
+host as a list of its pieces in the kernel's memory, the reply written
+back into such a list), a host device, and its own FUSE server and
+passthrough (`src/fuse/`). It existed because this stack was slow for it
+then: the console's virtio reset polled with a timer (44 ms of boot), and
+the server cost 2 to 7 times more per operation (no `READDIRPLUS`, a
+directory re-read per `READDIR`, an `fdatasync` per `close()`, double
+lookups, 64 KiB requests). It went when the reset fix made a virtio device
+cost no boot time and this transport with a fast server matched it (the
+numbers below); this device and NodeFS then took on what exobox's server
+and passthrough did, as the commits above. Its last code is
+linux-workers `02e67aa`.
+
+## The current numbers (October 29, 2026)
+
+The tree walk, hostfuse (linux-workers `02e67aa` and its kernel) against
+this device with NodeFS on exobox's JSPI host: musl's source, 2,690 files;
+a fresh machine a run; 6 runs a transport a round, the first thrown away;
+three rounds, the transports interleaved; a quiet laptop (load 0.3 to
+0.6). Median [range], ms:
+
+| | round 1: hostfuse / virtio-fs | round 2 | round 3 | virtio-fs ÷ hostfuse |
+|---|---|---|---|---|
+| `ls -lR` cold | 234 [185–552] / 166 [123–240] | 356 [203–643] / 147 [121–170] | 342 [223–524] / 128 [122–259] | 0.71, 0.41, 0.37 |
+| `ls -lR` warm | 224 [173–335] / 186 [150–229] | 204 [170–455] / 125 [120–317] | 311 [230–531] / 144 [126–242] | 0.83, 0.61, 0.46 |
+| `du -s` warm | 137 [100–364] / 87 [75–128] | 144 [118–401] / 79 [68–86] | 183 [118–238] / 78 [73–105] | 0.64, 0.55, 0.43 |
+| `cat` every `.c` warm | 1747 [666–2787] / 748 [415–2650] | 772 [450–2790] / 1200 [437–2403] | 1403 [529–1921] / 1221 [384–1481] | 0.43, 1.55, 0.87 |
+
+- **Metadata is faster here**, 1.2 to 2.7 times, and steadier:
+  `READDIRPLUS` and the commits above.
+- **Reading every file is level**: both spread from about 0.4 to 2.8 s
+  (the page cache or GC, not the transport), and the median changes sides
+  between rounds.
+- **Boot** (exobox's `boot-bench`, ready / first command, median of 7):
+  hostfuse 12.4 / 1.5 and 11.3 / 1.4 ms, virtio-fs 12.5 / 1.4 and
+  13.7 / 1.6 ms: within the noise.
+- Absolute numbers drift (hostfuse measured 151 ms for `ls -lR` cold in a
+  quiet run earlier that day); the comparison is within each round.
+
+The older measurements below are labelled by date and conditions.
+
 ## Appendix: measurements and analysis
 
 From linux-workers' harness (`bench/fs/`, removed from linux-workers in
@@ -80,7 +168,7 @@ October 2026 and in its git history; the Oct 29 numbers from
 device with NodeFS before the commits above; "exobox's server" is
 linux-workers' own FUSE server of the time, on this transport.
 
-### Conditions
+### Conditions (October 21, 2026)
 
 - **The desktop** (a Ryzen 9 7950X, idle, Node 24.21), one process: 6 runs,
   the first thrown away, the median of 5 (and the range). Each run boots a
@@ -92,7 +180,7 @@ linux-workers' own FUSE server of the time, on this transport.
   and page goes to the host. The tree's workloads are bash and coreutils on
   musl's source (2,710 files, 249 directories, 14 MB).
 
-### The fixes, together
+### The fixes, together (October 21, 2026, desktop)
 
 On the desktop (virtio before, after `21594e9` through `b6f5219` and
 `a34d5a5`'s original, `f18c90a`): readdir 5000 1131 to 25 ms, `ls -lR` 474
@@ -105,7 +193,7 @@ Originally `7ad0c9d`, `7a45e05`, `1099e34`, `7292910` and `f18c90a` on
 virtio layer of tombl's `bb7c6c5` (descriptor views in place of the old
 `VirtqueueChain.release(written, data)`).
 
-### Where the time went (before the device and NodeFS changes above)
+### Where the time went (October 21, 2026, before the device and NodeFS changes above)
 
 **His server**, against exobox's on this transport:
 
