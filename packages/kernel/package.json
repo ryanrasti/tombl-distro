@@ -16,12 +16,39 @@
   "type": "module",
   "exports": {
     ".": {
+      "development": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
     "./plugin": {
+      "development": "./src/plugin.ts",
       "types": "./dist/plugin.d.ts",
       "default": "./dist/plugin.js"
+    },
+    "./internal/wasm.js": {
+      "development": "./src/wasm.ts",
+      "types": "./dist/wasm.d.ts",
+      "default": "./dist/wasm.js"
+    },
+    "./internal/wasm_binary.js": {
+      "development": "./src/wasm_binary.ts",
+      "types": "./dist/wasm_binary.d.ts",
+      "default": "./dist/wasm_binary.js"
+    },
+    "./internal/devicetree.js": {
+      "development": "./src/devicetree.ts",
+      "types": "./dist/devicetree.d.ts",
+      "default": "./dist/devicetree.js"
+    },
+    "./internal/virtio/bus.js": {
+      "development": "./src/virtio/bus.ts",
+      "types": "./dist/virtio/bus.d.ts",
+      "default": "./dist/virtio/bus.js"
+    },
+    "./internal/virtio/device.js": {
+      "development": "./src/virtio/device.ts",
+      "types": "./dist/virtio/device.d.ts",
+      "default": "./dist/virtio/device.js"
     }
   },
   "scripts": {
