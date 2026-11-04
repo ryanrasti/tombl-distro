@@ -55,7 +55,23 @@ export interface VirtqueueChain extends Iterable<VirtqueueBuffer> {
  * iterator is single-shot and stays exhausted once the ring is empty, so
  * never hold one across an `await`.
  */
-export interface Virtqueue extends Iterable<VirtqueueChain> {}
+export interface Virtqueue extends Iterable<VirtqueueChain> {
+  /**
+   * Asks the guest to notify (kick) the device as it queues chains, or not
+   * (the packed ring's device event suppression). A device that stops
+   * notifications takes chains by iterating the queue itself, and turns them
+   * back on, then iterates once more, before it waits for a kick.
+   */
+  notifications(enabled: boolean): void;
+}
+
+/**
+ * A packed ring's event suppression structure (virtio 1.1, 2.8.10): its
+ * flags, after a 16-bit offset and wrap counter we don't use (no
+ * VIRTIO_RING_F_EVENT_IDX).
+ */
+const EVENT_FLAGS_OFFSET = 2;
+const EventFlags = { ENABLE: 0, DISABLE: 1 } as const;
 
 class Chain implements VirtqueueChain {
   #buffers: Array<VirtqueueBuffer & { address?: number }>;
@@ -144,10 +160,28 @@ export function publish_virtqueue_completion(
   Atomics.store(...flags_index(memory, completion.descriptor_address), completion.flags);
 }
 
+/** The flags word of an event suppression structure at `address` (0: none). */
+const event_flags = (memory: WebAssembly.Memory, address: number) => {
+  const flags = new Uint16Array(memory.buffer);
+  return [flags, (address + EVENT_FLAGS_OFFSET) >>> 1] as const;
+};
+
+/**
+ * Whether the driver wants interrupts for completions on a queue whose
+ * driver event suppression structure is at `address` (0: always). It turns
+ * them off while it polls the queue itself, and checks the queue again as
+ * it turns them back on, so a completion published meanwhile isn't lost.
+ */
+export function wants_interrupt(memory: WebAssembly.Memory, address: number) {
+  return address === 0 || Atomics.load(...event_flags(memory, address)) !== EventFlags.DISABLE;
+}
+
 export class PackedVirtqueue implements Virtqueue {
   #memory: WebAssembly.Memory;
   #size: number;
   #desc_addr: number;
+  /** The device event suppression structure: whether the driver notifies us (0: none). */
+  #device_event_addr: number;
   #publish: (completion: VirtqueueCompletion) => void;
   #is_current: () => boolean;
   #views: boolean;
@@ -164,12 +198,14 @@ export class PackedVirtqueue implements Virtqueue {
     publish: (completion: VirtqueueCompletion) => void,
     is_current: () => boolean = () => true,
     views = false,
+    device_event_addr = 0,
   ) {
     assert(size !== 0);
     assert(desc_addr % VirtqDescriptor.size === 0, "packed ring must be 16-byte aligned");
     this.#memory = memory;
     this.#size = size;
     this.#desc_addr = desc_addr;
+    this.#device_event_addr = device_event_addr;
     this.#publish = publish;
     this.#is_current = is_current;
     this.#views = views;
@@ -177,6 +213,14 @@ export class PackedVirtqueue implements Virtqueue {
 
   invalidate() {
     this.#valid = false;
+  }
+
+  notifications(enabled: boolean) {
+    if (this.#device_event_addr === 0 || !this.#valid || !this.#is_current()) return;
+    Atomics.store(
+      ...event_flags(this.#memory, this.#device_event_addr),
+      enabled ? EventFlags.ENABLE : EventFlags.DISABLE,
+    );
   }
 
   #descriptor(index: number) {

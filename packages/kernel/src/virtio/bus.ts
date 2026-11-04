@@ -59,8 +59,8 @@ export class VirtioBus {
         config_irqs.set(dev, config_irq);
         at(dev).setup(config_irq, config_addr >>> 0, config_len >>> 0);
       },
-      enable_vring: (dev, vq, size, desc_addr, irq) =>
-        at(dev).enable_queue(vq, size, desc_addr >>> 0, irq),
+      enable_vring: (dev, vq, size, desc_addr, driver_addr, device_addr, irq) =>
+        at(dev).enable_queue(vq, size, desc_addr >>> 0, driver_addr >>> 0, device_addr >>> 0, irq),
       disable_vring: (dev, vq) => at(dev).disable_queue(vq),
       notify: (dev, vq) => at(dev).notify(vq),
       reset: (dev, done) => {

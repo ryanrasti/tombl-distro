@@ -6,6 +6,7 @@ import {
   PackedVirtqueue,
   publish_virtqueue_completion,
   TransportFeatures,
+  wants_interrupt,
   type Virtqueue,
   type VirtqueueCompletion,
 } from "./queue.ts";
@@ -24,7 +25,19 @@ export interface Device extends MachinePluginProvider {
 export interface ConnectedVirtioDevice {
   set_features(features: bigint): void;
   setup(config_irq: number, config_address: number, config_length: number): void;
-  enable_queue(vq: number, size: number, descriptor_address: number, irq: number): void;
+  /**
+   * The queue's packed ring, and its event suppression structures: the
+   * driver's (whether it wants interrupts) and the device's (whether it
+   * notifies); 0 for none.
+   */
+  enable_queue(
+    vq: number,
+    size: number,
+    descriptor_address: number,
+    driver_event_address: number,
+    device_event_address: number,
+    irq: number,
+  ): void;
   disable_queue(vq: number): void;
   notify(vq: number): void;
   /** Settles once the device has finished with the guest memory it was given. */
@@ -312,7 +325,14 @@ export abstract class VirtioDevice implements BusDevice {
           this.update_config();
         }
       },
-      enable_queue: (vq, size, descriptor_address, irq) => {
+      enable_queue: (
+        vq,
+        size,
+        descriptor_address,
+        driver_event_address,
+        device_event_address,
+        irq,
+      ) => {
         const state = queue_state(vq);
         state.queue?.invalidate();
         let armed = false;
@@ -331,11 +351,15 @@ export abstract class VirtioDevice implements BusDevice {
             armed = true;
             queueMicrotask(() => {
               armed = false;
-              if (state.queue === queue) context.trigger_irq(irq);
+              // (none while the driver polls the queue itself: it looks again as it stops)
+              if (state.queue === queue && wants_interrupt(context.memory, driver_event_address)) {
+                context.trigger_irq(irq);
+              }
             });
           },
           () => state.queue === queue && (context.queue_is_current?.(vq) ?? true),
           this.#views,
+          device_event_address,
         );
         state.queue = queue;
         if (state.pending) void drain(vq);

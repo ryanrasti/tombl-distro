@@ -357,6 +357,8 @@ class VirtioVsock extends VirtioDevice {
   // Packets are small and bounded by the peer's credit, so they queue here
   // until the guest posts buffers for them.
   readonly #pending: PendingPacket[] = [];
+  /** The receive queue, polled for the guest's buffers: it doesn't notify us of them while we have some. */
+  #rx_queue: Virtqueue | undefined;
   readonly #connections = new Map<string, VsockConnectionState>();
   readonly #listeners = new Map<number, VsockListener>();
   #next_port = 49152;
@@ -383,6 +385,21 @@ class VirtioVsock extends VirtioDevice {
    * payload larger than a buffer split across buffers, a packet each.
    */
   #flush() {
+    for (;;) {
+      this.#deliver();
+      if (this.#pending.length === 0 || !this.#rx_queue) return;
+      // Out of buffers: take what the guest posted without notifying us;
+      // else ask it to, and look once more (it may have posted meanwhile).
+      this.#rx.post(this.#rx_queue);
+      if (this.#rx.available > 0) continue;
+      this.#rx_queue.notifications(true);
+      this.#rx.post(this.#rx_queue);
+      if (this.#rx.available === 0) return;
+      this.#rx_queue.notifications(false);
+    }
+  }
+
+  #deliver() {
     while (
       this.#pending.length > 0 &&
       this.#rx.deliver((chain) => {
@@ -565,6 +582,9 @@ class VirtioVsock extends VirtioDevice {
   protected kick(vq: number, queue: Virtqueue) {
     switch (vq) {
       case 0:
+        // (a kick: we asked for one, out of buffers; we poll again from here)
+        this.#rx_queue = queue;
+        queue.notifications(false);
         this.#rx.post(queue);
         this.#flush();
         break;
@@ -582,6 +602,7 @@ class VirtioVsock extends VirtioDevice {
 
   protected reset() {
     this.#rx.reset();
+    this.#rx_queue = undefined;
     this.#pending.length = 0;
     for (const state of this.#connections.values()) {
       if (!state.connected) {

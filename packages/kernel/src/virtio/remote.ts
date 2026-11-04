@@ -11,7 +11,11 @@ import {
   public_handle,
   type VirtioConnectionContext,
 } from "./device.ts";
-import { publish_virtqueue_completion, type VirtqueueCompletion } from "./queue.ts";
+import {
+  publish_virtqueue_completion,
+  type VirtqueueCompletion,
+  wants_interrupt,
+} from "./queue.ts";
 
 /*
  * The queue protocol deliberately has no request IDs. Transport operations
@@ -63,6 +67,7 @@ type DeviceMessage =
       vq: number;
       size: number;
       descriptor_address: number;
+      device_event_address: number;
       irq: number;
       device_epoch: number;
       queue_epoch: number;
@@ -211,6 +216,8 @@ function connect_remote_device(
   const control = new Int32Array(control_buffer);
   const queue_epochs = new Int32Array(transport.queues);
   const enabled = new Uint8Array(transport.queues);
+  /** Each queue's driver event suppression structure (whether it wants interrupts). */
+  const driver_events: number[] = [];
   let config_target: Uint8Array | undefined;
   let failed = false;
   // Resets the worker has not yet acknowledged, oldest first. Only the
@@ -237,7 +244,9 @@ function connect_remote_device(
         )
           return;
         publish_virtqueue_completion(context.memory, message.completion);
-        context.trigger_irq(message.irq);
+        if (wants_interrupt(context.memory, driver_events[message.vq] ?? 0)) {
+          context.trigger_irq(message.irq);
+        }
         return;
       }
       case "config":
@@ -270,8 +279,9 @@ function connect_remote_device(
       config_target.set(transport.config);
       post_endpoint(endpoint, { type: "setup", config_irq, config_length } satisfies DeviceMessage);
     },
-    enable_queue(vq, size, descriptor_address, irq) {
+    enable_queue(vq, size, descriptor_address, driver_event_address, device_event_address, irq) {
       assert(vq < transport.queues, `virtio device has no queue ${vq}`);
+      driver_events[vq] = driver_event_address;
       Atomics.add(control, 1 + vq, 1);
       const queue_epoch = (queue_epochs[vq] = Atomics.load(control, 1 + vq));
       const device_epoch = Atomics.load(control, 0);
@@ -281,6 +291,7 @@ function connect_remote_device(
         vq,
         size,
         descriptor_address,
+        device_event_address,
         irq,
         device_epoch,
         queue_epoch,
@@ -409,10 +420,13 @@ export function serveDevice(endpoint: Endpoint, handle: Device): void {
         case "enable":
           device_epoch = message.device_epoch;
           queue_epochs[message.vq] = message.queue_epoch;
+          // (the worker publishes no interrupts of its own: the main thread checks the driver's structure)
           connected?.enable_queue(
             message.vq,
             message.size,
             message.descriptor_address,
+            0,
+            message.device_event_address,
             message.irq,
           );
           return;

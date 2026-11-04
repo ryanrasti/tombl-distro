@@ -222,7 +222,7 @@ test("virtio-net preserves pending frames but drops receive chains on reset", as
   };
 
   queue_receive(0, 64);
-  imports.enable_vring(0, 0, 1, 0, 1);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 1);
   imports.notify(0, 0);
   imports.reset(0, 0);
   imports.disable_vring(0, 0);
@@ -232,7 +232,7 @@ test("virtio-net preserves pending frames but drops receive chains on reset", as
   assert.deepEqual([...new Uint8Array(net_memory.buffer, 64, 26)], Array(26).fill(0));
 
   queue_receive(128, 256);
-  imports.enable_vring(0, 0, 1, 128, 2);
+  imports.enable_vring(0, 0, 1, 128, 0, 0, 2);
   imports.notify(0, 0);
   await Promise.resolve();
   assert.deepEqual([...new Uint8Array(net_memory.buffer, 256 + 12, frame.byteLength)], [...frame]);
@@ -276,7 +276,7 @@ test("virtio block reports a short caller-buffer read as IOERR", async () => {
   descriptor(2, 1024, 1, available | writable);
   new Uint8Array(block_memory.buffer, 1024, 1)[0] = 0xff;
 
-  imports.enable_vring(0, 0, 4, 0, 1);
+  imports.enable_vring(0, 0, 4, 0, 0, 0, 1);
   imports.notify(0, 0);
   await interrupted.promise;
 
@@ -324,7 +324,7 @@ test("console input is held until the guest opens its port", async () => {
   descriptor.setUint32(8, 4, true);
   descriptor.setUint16(12, 0, true);
   descriptor.setUint16(14, 0, true);
-  imports.enable_vring(0, 0, 1, 0, 1);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 1);
   imports.notify(0, 0);
 
   // The host writes "hi" before the guest opens /dev/hvc0, and the input
@@ -343,7 +343,7 @@ test("console input is held until the guest opens its port", async () => {
   replacement.setUint32(8, 4, true);
   replacement.setUint16(12, 0, true);
   replacement.setUint16(14, (1 << 7) | (1 << 1), true);
-  imports.enable_vring(0, 0, 1, replacement_ring, 1);
+  imports.enable_vring(0, 0, 1, replacement_ring, 0, 0, 1);
   imports.notify(0, 0);
   assert.deepEqual(
     [...new Uint8Array(console_memory.buffer, 256, 2)],
@@ -359,7 +359,7 @@ test("console input is held until the guest opens its port", async () => {
   output_descriptor.setUint32(8, 5, true);
   output_descriptor.setUint16(12, 0, true);
   output_descriptor.setUint16(14, 1 << 7);
-  imports.enable_vring(0, 1, 1, output_ring, 2);
+  imports.enable_vring(0, 1, 1, output_ring, 0, 0, 2);
   imports.notify(0, 1);
   const undelivered = new Promise((resolve) => setTimeout(resolve, 50));
   await Promise.race([delivered.promise, undelivered]);
@@ -395,7 +395,7 @@ test("virtio-vsock drops guest buffers and connections on reset", async () => {
   descriptor.setUint32(8, 64, true);
   descriptor.setUint16(12, 0, true);
   descriptor.setUint16(14, (1 << 7) | (1 << 1), true);
-  imports.enable_vring(0, 0, 1, 0, 1);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 1);
   imports.notify(0, 0);
   imports.reset(0, 0);
 
@@ -461,7 +461,7 @@ test("virtio reset invalidates stale chains and pending notifications", async ()
   };
 
   const stale_descriptor = queue_descriptor(0, 64);
-  imports.enable_vring(0, 0, 1, 0, 1);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 1);
   imports.notify(0, 0);
   imports.notify(0, 0);
   assert.equal(notifications, 1);
@@ -483,7 +483,7 @@ test("virtio reset invalidates stale chains and pending notifications", async ()
   assert.equal(notifications, 1, "reset discarded the coalesced old kick");
 
   const restored_descriptor = queue_descriptor(128, 192);
-  imports.enable_vring(0, 0, 1, 128, 2);
+  imports.enable_vring(0, 0, 1, 128, 0, 0, 2);
   imports.notify(0, 0);
   for (let i = 0; i < 10; i++) {
     if (restored_descriptor.getUint16(14, true) & (1 << 15)) break;
@@ -557,7 +557,7 @@ test("a remote virtio worker owns chains but the main thread publishes completio
   assert.equal(new Uint8Array(remote_memory.buffer, config_address, 1)[0], 7);
 
   const descriptor = queue_descriptor(0, 64);
-  imports.enable_vring(0, 0, 1, 0, 5);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 5);
   imports.notify(0, 0);
   const first = await first_chain.promise;
   first.array[0] = 0xaa;
@@ -579,7 +579,7 @@ test("a remote virtio worker owns chains but the main thread publishes completio
   assert.equal(new Uint8Array(remote_memory.buffer, config_address, 1)[0], 9);
 
   queue_descriptor(128, 192);
-  imports.enable_vring(0, 0, 1, 128, 6);
+  imports.enable_vring(0, 0, 1, 128, 0, 0, 6);
   imports.notify(0, 0);
   const stale = await stale_chain.promise;
   imports.reset(0, 0);
@@ -709,7 +709,7 @@ test("virtio close drains active queue work before one-time cleanup", async () =
   descriptor.setUint32(8, 1, true);
   descriptor.setUint16(12, 0, true);
   descriptor.setUint16(14, 1 << 7, true);
-  imports.enable_vring(0, 0, 1, 0, 1);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 1);
   imports.notify(0, 0);
 
   assert.equal(notifications, 1);
@@ -780,7 +780,7 @@ test("virtio tracks a handler before it can reentrantly close", async () => {
   descriptor.setUint32(8, 1, true);
   descriptor.setUint16(12, 0, true);
   descriptor.setUint16(14, 1 << 7, true);
-  imports.enable_vring(0, 0, 1, 0, 1);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 1);
   imports.notify(0, 0);
 
   const closing = close_device(device.handle);
@@ -827,7 +827,7 @@ test("virtio stop can unblock a handler before final cleanup", async () => {
   descriptor.setUint32(8, 1, true);
   descriptor.setUint16(12, 0, true);
   descriptor.setUint16(14, 1 << 7, true);
-  imports.enable_vring(0, 0, 1, 0, 1);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 1);
   imports.notify(0, 0);
 
   await close_device(device.handle);
@@ -874,13 +874,13 @@ test("virtio-net holds unicast senders until the guest takes their frames", asyn
   tx.setBigUint64(0, 0x900n, true);
   tx.setUint32(8, announcement.byteLength, true);
   tx.setUint16(14, 1 << 7, true);
-  imports.enable_vring(0, 1, 1, tx_ring, 2);
+  imports.enable_vring(0, 1, 1, tx_ring, 0, 0, 2);
   imports.notify(0, 1);
   await new Promise((resolve) => setTimeout(resolve, 1));
 
   const ring = 0;
   post_receive_buffers(net_memory, ring, 32);
-  imports.enable_vring(0, 0, 32, ring, 1);
+  imports.enable_vring(0, 0, 32, ring, 0, 0, 1);
 
   const sends: Promise<void>[] = [];
   let index = 0;
@@ -935,7 +935,7 @@ test("a stalled recipient does not hold a NIC through reset or close", async () 
     descriptor.setBigUint64(0, BigInt(buffer), true);
     descriptor.setUint32(8, packet.byteLength, true);
     descriptor.setUint16(14, 1 << 7, true);
-    imports.enable_vring(0, 1, 1, ring, 2);
+    imports.enable_vring(0, 1, 1, ring, 0, 0, 2);
     imports.notify(0, 1);
   };
   const tick = () => new Promise((resolve) => setTimeout(resolve, 1));
@@ -1003,14 +1003,14 @@ test("console input is read only as the guest consumes it", async () => {
   };
 
   // Open the port with an empty transmit, then post two receive buffers.
-  imports.enable_vring(0, 1, 1, 512, 2);
+  imports.enable_vring(0, 1, 1, 512, 0, 0, 2);
   new DataView(console_memory.buffer, 512, 16).setUint16(14, 1 << 7, true);
   imports.notify(0, 1);
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(pulls, 0, "no input is read before the guest posts a buffer");
 
   post_receive_buffers(console_memory, 0, 2);
-  imports.enable_vring(0, 0, 4, 0, 1);
+  imports.enable_vring(0, 0, 4, 0, 0, 0, 1);
   imports.notify(0, 0);
   await wait(() => new Uint8Array(console_memory.buffer, 0x1000 + 128, 1)[0] !== 0);
   await new Promise((r) => setTimeout(r, 10));
@@ -1090,7 +1090,7 @@ test("virtio block completes independent requests out of order", async () => {
   });
   const first = ring.request(0, 0, [{ length: 512 }]);
   const second = ring.request(0, 1, [{ length: 512 }]);
-  imports.enable_vring(0, 0, 16, 0, 1);
+  imports.enable_vring(0, 0, 16, 0, 0, 0, 1);
   imports.notify(0, 0);
 
   await turns();
@@ -1124,7 +1124,7 @@ test("virtio block fails requests outside its sectors or segment limit", async (
   const too_many = ring.request(0, 0, segments(129));
   const most = ring.request(0, 0, segments(114));
   const last = ring.request(0, 7, [{ length: 512 }]);
-  imports.enable_vring(0, 0, 256, 0, 1);
+  imports.enable_vring(0, 0, 256, 0, 0, 0, 1);
   imports.notify(0, 0);
   await turns();
 
@@ -1162,7 +1162,7 @@ test(
       },
     });
     block_ring(memory).request(0, 0, [{ length: 512 }]);
-    imports.enable_vring(0, 0, 16, 0, 1);
+    imports.enable_vring(0, 0, 16, 0, 0, 0, 1);
     imports.notify(0, 0);
     for (let i = 0; i < 100 && !closing; i++) await turns(1);
     assert(closing, "the failure was reported");
@@ -1193,7 +1193,7 @@ test("virtio block flushes only after earlier writes complete", async () => {
   });
   ring.request(1, 0, [{ length: 512 }]);
   const flush = ring.request(4, 0, []);
-  imports.enable_vring(0, 0, 16, 0, 1);
+  imports.enable_vring(0, 0, 16, 0, 0, 0, 1);
   imports.notify(0, 0);
 
   await turns();
@@ -1241,7 +1241,7 @@ test("virtio block hands storage guest memory in as few calls as it can", async 
     { address: 0x5000, length: 512 },
     { address: 0x6000, length: 512 },
   ]);
-  imports.enable_vring(0, 0, 32, 0, 1);
+  imports.enable_vring(0, 0, 32, 0, 0, 0, 1);
   imports.notify(0, 0);
   await turns();
 
@@ -1279,7 +1279,7 @@ test("virtio block makes one vectored call for a split request", async () => {
     { address: 0x7000, length: 512 },
     { address: 0x7800, length: 512 },
   ]);
-  imports.enable_vring(0, 0, 32, 0, 1);
+  imports.enable_vring(0, 0, 32, 0, 0, 0, 1);
   imports.notify(0, 0);
   await turns();
 
@@ -1304,7 +1304,7 @@ test("virtio block close waits for requests in flight", async () => {
     },
   });
   ring.request(0, 0, [{ length: 512 }]);
-  imports.enable_vring(0, 0, 16, 0, 1);
+  imports.enable_vring(0, 0, 16, 0, 0, 0, 1);
   imports.notify(0, 0);
   const closing = close_device(device);
   await turns();
@@ -1340,7 +1340,7 @@ test(
     });
     const ring = block_ring(memory);
     const read = ring.request(0, 1, [{ length: 512 }, { length: 512 }]);
-    imports.enable_vring(0, 0, 16, 0, 1);
+    imports.enable_vring(0, 0, 16, 0, 0, 0, 1);
     imports.notify(0, 0);
     await interrupted.promise;
 
@@ -1384,7 +1384,7 @@ test("a device with views works on guest memory in place", async () => {
   };
   descriptor(0, 0x100, 1);
   descriptor(1, 0x200, 1 << 1);
-  imports.enable_vring(0, 0, 4, 0, 1);
+  imports.enable_vring(0, 0, 4, 0, 0, 0, 1);
   imports.notify(0, 0);
 
   const { readable, writable } = await seen.promise;
@@ -1418,7 +1418,7 @@ test("a virtqueue rejects an indirect table longer than the queue", async () => 
   descriptor.setBigUint64(0, 0x100n, true);
   descriptor.setUint32(8, 2 * 16, true);
   descriptor.setUint16(14, (1 << 7) | (1 << 2), true);
-  imports.enable_vring(0, 0, 1, 0, 1);
+  imports.enable_vring(0, 0, 1, 0, 0, 0, 1);
   imports.notify(0, 0);
   assert.match(String(await failure.promise), /malformed indirect buffer/);
   assert(kicked);
@@ -1451,7 +1451,7 @@ async function reset_during_slow_read(
   try {
     const ring = block_ring(memory);
     const read = ring.request(0, 0, [{ length: 512 }]);
-    imports.enable_vring(0, 0, 16, 0, 1);
+    imports.enable_vring(0, 0, 16, 0, 0, 0, 1);
     imports.notify(0, 0);
     await turns();
 
