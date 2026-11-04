@@ -245,6 +245,11 @@ export abstract class VirtioDevice implements BusDevice {
     return this.closed;
   }
 
+  /**
+   * Runs a kick: undefined once it's done, if it finished before returning
+   * (the next kick may run at once), else its promise. Throws what a
+   * synchronous kick throws.
+   */
   #dispatch(vq: number, queue: Virtqueue): Promise<void> | undefined {
     if (this.#stopped) return;
     assert(vq < this.queues, `virtio device has no queue ${vq}`);
@@ -252,11 +257,18 @@ export abstract class VirtioDevice implements BusDevice {
     // Track the kick before running it, so a kick that reentrantly shuts the
     // device down is still awaited before close().
     this.#active.add(completion.promise);
+    let result: void | PromiseLike<void>;
     try {
-      Promise.resolve(this.kick(vq, queue)).then(completion.resolve, completion.reject);
+      result = this.kick(vq, queue);
     } catch (error) {
-      completion.reject(error);
+      this.#active.delete(completion.promise);
+      throw error;
     }
+    if (!result || typeof result.then !== "function") {
+      this.#active.delete(completion.promise);
+      return;
+    }
+    Promise.resolve(result).then(completion.resolve, completion.reject);
     void completion.promise.finally(() => this.#active.delete(completion.promise)).catch(() => {});
     return completion.promise;
   }
@@ -270,20 +282,35 @@ export abstract class VirtioDevice implements BusDevice {
     const queue_state = (vq: number) =>
       (queues[vq] ??= { queue: undefined, pending: false, notifying: false });
 
-    const drain = async (vq: number) => {
+    // A kick done before it returns frees its queue at once: the guest's
+    // next notification is handled as it comes, not after the event loop's
+    // next turn (which a guest that keeps running, or ends, may not give).
+    const drain = (vq: number): void => {
       const state = queue_state(vq);
       if (state.notifying || !state.queue) return;
       state.notifying = true;
       try {
         do {
           state.pending = false;
-          await this.#dispatch(vq, state.queue);
+          const running = this.#dispatch(vq, state.queue);
+          if (running) {
+            running.then(
+              () => {
+                state.notifying = false;
+                if (state.pending) drain(vq);
+              },
+              (error) => {
+                state.notifying = false;
+                context.on_error(error);
+              },
+            );
+            return;
+          }
         } while (state.pending && state.queue);
       } catch (error) {
         context.on_error(error);
-      } finally {
-        state.notifying = false;
       }
+      state.notifying = false;
     };
 
     return {

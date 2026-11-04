@@ -66,21 +66,33 @@ function concat_bytes(chunks: Uint8Array[]) {
 /**
  * A connection between this process and a guest, over vsock: a byte stream,
  * or for a SEQPACKET connection a sequence of messages (each `read` one
- * message, each `write` one message).
+ * message, each `write` one message; a zero-length message isn't read, as
+ * an empty read is the end).
  */
 export interface VsockConnection {
   /** Whether it carries messages (SOCK_SEQPACKET) rather than a byte stream. */
   readonly seqpacket: boolean;
-  /** Reads the next chunk (or message); an empty chunk means the peer has finished sending. */
+  /** Its port on the host (CID 2), and the guest's. */
+  readonly local_port: number;
+  readonly peer_port: number;
+  /**
+   * Reads the next chunk (or message); an empty chunk means the peer has
+   * finished sending. Rejects once the peer has reset it, after what came
+   * before.
+   */
   read(): Promise<Uint8Array>;
   /** Reads `length` bytes, or fewer if the peer finishes first. */
   readExactly(length: number): Promise<Uint8Array>;
   /** Writes data (one message, on a SEQPACKET connection), waiting for credit when the peer's buffer is full. */
   write(data: Uint8Array): Promise<void>;
+  /** The peer's credit: how much more its buffer takes than what's been sent to it. */
+  readonly credit: number;
   /** Finishes sending once queued writes are sent; reading continues. */
   shutdown(): void;
   /** Closes the connection. */
   close(): void;
+  /** Resets the connection (RST): what's unsent or unread is dropped. */
+  reset(): void;
 }
 
 interface VsockConnectionController {
@@ -95,12 +107,14 @@ interface VsockConnectionController {
   enqueue(data: Uint8Array, flags: number): void;
   /** The peer's SHUTDOWN flags. */
   shutdown_from_peer(flags: number): void;
-  close_from_peer(): void;
+  /** The connection is gone: closed, or (reset) reset by the peer. */
+  close_from_peer(reset?: boolean): void;
 }
 
 interface VsockConnectionOps {
   send(op: number, flags: number, payload: Uint8Array, fwd_cnt: number): void;
   close(): void;
+  reset(): void;
 }
 
 function create_vsock_connection(
@@ -120,6 +134,8 @@ function create_vsock_connection(
   /** We have finished sending, or the peer won't receive. */
   let write_done = false;
   let closed = false;
+  /** The peer reset it: reads fail once what came before is read. */
+  let reset_by_peer = false;
   let bytes_read = 0;
   let bytes_written = 0;
   let last_credit_update = 0;
@@ -144,9 +160,10 @@ function create_vsock_connection(
     wake_credit_waiters();
   }
 
-  function close_from_peer() {
+  function close_from_peer(reset = false) {
     if (closed) return;
     closed = true;
+    reset_by_peer = reset;
     end_reads();
     end_writes();
   }
@@ -154,8 +171,11 @@ function create_vsock_connection(
   async function read_chunk(): Promise<Uint8Array> {
     const chunk = read_buffer.shift();
     if (chunk) return chunk;
+    if (read_done && reset_by_peer) throw new Error("vsock connection reset");
     if (read_done) return new Uint8Array();
-    return new Promise((resolve) => read_waiters.push(resolve));
+    const next = await new Promise<Uint8Array>((resolve) => read_waiters.push(resolve));
+    if (next.byteLength === 0 && reset_by_peer) throw new Error("vsock connection reset");
+    return next;
   }
 
   function consume(length: number) {
@@ -223,9 +243,14 @@ function create_vsock_connection(
 
   const connection: VsockConnection = {
     seqpacket,
+    local_port,
+    peer_port,
     read,
     readExactly,
     write,
+    get credit() {
+      return Math.max(0, peer_buf_alloc - ((bytes_written - peer_fwd_cnt) >>> 0));
+    },
     shutdown() {
       write_tail = write_tail.then(() => {
         if (write_done) return;
@@ -236,6 +261,11 @@ function create_vsock_connection(
     close() {
       if (closed) return;
       ops.close();
+      close_from_peer();
+    },
+    reset() {
+      if (closed) return;
+      ops.reset();
       close_from_peer();
     },
   };
@@ -265,9 +295,8 @@ function create_vsock_connection(
         if ((flags & SEQ_EOM) === 0) return;
         data = message.length === 1 ? data : concat_bytes(message);
         message = [];
-      } else if (data.byteLength === 0) {
-        return;
       }
+      if (data.byteLength === 0) return;
       const waiter = read_waiters.shift();
       if (waiter) waiter(data);
       else read_buffer.push(data);
@@ -288,7 +317,11 @@ interface VsockConnectionState {
 }
 
 /** A host listener's connections, as the guest makes them. */
-type VsockListener = (connection: VsockConnection) => void;
+/**
+ * A host listener's connections, as the guest makes them: accepted at once,
+ * or (a promise) once it resolves, and reset if it rejects.
+ */
+type VsockListener = (connection: VsockConnection) => void | PromiseLike<unknown>;
 
 /**
  * A virtio-vsock device: stream and SEQPACKET sockets between the guest and
@@ -465,6 +498,12 @@ class VirtioVsock extends VirtioDevice {
           new Uint8Array(),
         );
       },
+      reset: () => {
+        const connection = this.#connections.get(key)?.controller;
+        if (!connection) return;
+        this.#send(connection, VsockOp.RST, 0, new Uint8Array());
+        this.#connections.delete(key);
+      },
     };
   }
 
@@ -498,8 +537,20 @@ class VirtioVsock extends VirtioDevice {
       resolve() {},
       reject() {},
     });
-    this.#send(controller, VsockOp.RESPONSE, 0, new Uint8Array());
-    listener(controller.connection);
+    const accepted = listener(controller.connection);
+    if (!accepted) {
+      this.#send(controller, VsockOp.RESPONSE, 0, new Uint8Array());
+      return;
+    }
+    // (answered once the listener says: its connection made, or not)
+    Promise.resolve(accepted).then(
+      () => {
+        if (this.#connections.get(key)?.controller === controller) {
+          this.#send(controller, VsockOp.RESPONSE, 0, new Uint8Array());
+        }
+      },
+      () => controller.connection.reset(),
+    );
   }
 
   #handle_tx_packet(header: VsockHeader, payload: Uint8Array) {
@@ -554,7 +605,7 @@ class VirtioVsock extends VirtioDevice {
         if (!state.connected) {
           state.reject(new Error("guest reset vsock connection"));
         }
-        connection.close_from_peer();
+        connection.close_from_peer(true);
         this.#connections.delete(key);
         break;
       default:
