@@ -112,7 +112,14 @@ interface VsockConnectionController {
 }
 
 interface VsockConnectionOps {
-  send(op: number, flags: number, payload: Uint8Array, fwd_cnt: number): void;
+  /** Sends a packet; delivered, once it's in the guest's buffers (or dropped). */
+  send(
+    op: number,
+    flags: number,
+    payload: Uint8Array,
+    fwd_cnt: number,
+    delivered?: () => void,
+  ): void;
   close(): void;
   reset(): void;
 }
@@ -223,20 +230,26 @@ function create_vsock_connection(
       }
       const n = Math.min(MAX_VSOCK_PAYLOAD, available, data.byteLength - offset);
       const last = offset + n === data.byteLength;
+      // (the last piece's delivery: every piece is in the guest's buffers, in order)
+      const delivered = last ? Promise.withResolvers<void>() : undefined;
       ops.send(
         VsockOp.RW,
         seqpacket && last ? SEQ_EOM : 0,
         data.subarray(offset, offset + n),
         bytes_read,
+        delivered?.resolve,
       );
       offset += n;
       bytes_written = (bytes_written + n) >>> 0;
+      if (delivered) await delivered.promise;
     } while (offset < data.byteLength);
   }
 
+  // (not copied: the write resolves once its bytes are in the guest's buffers,
+  // when the caller may reuse its own; measured: the copy was a sixth of a
+  // 256 MB transfer to the guest)
   function write(data: Uint8Array): Promise<void> {
-    const bytes = data.slice();
-    const result = write_tail.then(() => write_serialized(bytes));
+    const result = write_tail.then(() => write_serialized(data));
     write_tail = result.catch(() => {});
     return result;
   }
@@ -379,6 +392,8 @@ interface PendingPacket {
   flags: number;
   fwd_cnt: number;
   payload: Uint8Array;
+  /** Called once its last piece is in the guest's buffers, or it's dropped. */
+  delivered?: () => void;
 }
 
 /** A connection's key: its two ports. */
@@ -441,8 +456,10 @@ class VirtioVsock extends VirtioDevice {
         hdr.setUint32(36, DEFAULT_VSOCK_BUF_ALLOC, true);
         hdr.setUint32(40, packet.fwd_cnt, true);
         desc.array.set(packet.payload.subarray(0, n), VsockHeader.size);
-        if (last) this.#pending.shift();
-        else packet.payload = packet.payload.subarray(n);
+        if (last) {
+          this.#pending.shift();
+          packet.delivered?.();
+        } else packet.payload = packet.payload.subarray(n);
         return VsockHeader.size + n;
       })
     );
@@ -456,8 +473,9 @@ class VirtioVsock extends VirtioDevice {
     flags: number,
     payload: Uint8Array,
     fwd_cnt: number,
+    delivered?: () => void,
   ) {
-    this.#pending.push({ local_port, peer_port, type, op, flags, fwd_cnt, payload });
+    this.#pending.push({ local_port, peer_port, type, op, flags, fwd_cnt, payload, delivered });
     this.#flush();
   }
 
@@ -467,6 +485,7 @@ class VirtioVsock extends VirtioDevice {
     flags: number,
     payload: Uint8Array,
     fwd_cnt = connection.bytes_read,
+    delivered?: () => void,
   ) {
     this.#send_packet(
       connection.local_port,
@@ -476,17 +495,20 @@ class VirtioVsock extends VirtioDevice {
       flags,
       payload,
       fwd_cnt,
+      delivered,
     );
   }
 
   /** A connection's ops: its packets sent while it's still ours. */
   #ops(key: string): VsockConnectionOps {
     return {
-      send: (op, flags, payload, fwd_cnt) => {
-        if (this.stopped) return;
-        const connection = this.#connections.get(key)?.controller;
-        if (!connection) return;
-        this.#send(connection, op, flags, payload, fwd_cnt);
+      send: (op, flags, payload, fwd_cnt, delivered) => {
+        const connection = this.stopped ? undefined : this.#connections.get(key)?.controller;
+        if (!connection) {
+          delivered?.();
+          return;
+        }
+        this.#send(connection, op, flags, payload, fwd_cnt, delivered);
       },
       close: () => {
         const connection = this.#connections.get(key)?.controller;
@@ -633,7 +655,8 @@ class VirtioVsock extends VirtioDevice {
 
   protected reset() {
     this.#rx.reset();
-    this.#pending.length = 0;
+    // (dropped: their writers let go)
+    for (const p of this.#pending.splice(0)) p.delivered?.();
     for (const state of this.#connections.values()) {
       if (!state.connected) {
         state.reject(new Error("vsock device reset while connecting"));
@@ -653,6 +676,7 @@ class VirtioVsock extends VirtioDevice {
     }
     this.#connections.clear();
     this.#listeners.clear();
+    for (const p of this.#pending.splice(0)) p.delivered?.();
     this.#rx.close();
   }
 
