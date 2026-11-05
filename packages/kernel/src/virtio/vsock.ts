@@ -792,6 +792,10 @@ class VirtioVsock extends VirtioDevice {
         made.reject(error);
       },
     });
+    // (closed or reset here before the guest answers: never made)
+    void connection.connection.closed.then(() =>
+      made.reject(new Error("vsock connection closed before it was made")),
+    );
     this.#send(connection, VsockOp.REQUEST, 0, new Uint8Array());
     return connection.connection;
   }

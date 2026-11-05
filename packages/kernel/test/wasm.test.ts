@@ -564,6 +564,15 @@ test("virtio-vsock refuses an opened connection the guest resets: opened rejects
   await close_device(device);
 });
 
+test("virtio-vsock rejects an opened connection reset before the guest answers", async () => {
+  const device = vsockDevice();
+  vsock_guest(device);
+  const connection = device.open(5002);
+  connection.reset();
+  await assert.rejects(connection.opened, /before it was made/);
+  await close_device(device);
+});
+
 test("virtio reset invalidates stale chains and pending notifications", async () => {
   const reset_memory = new WebAssembly.Memory({
     initial: 1,
