@@ -99,6 +99,15 @@ export interface VsockConnection {
   reset(): void;
   /** Resolves once it's gone: closed, or reset, by either end. */
   readonly closed: Promise<void>;
+  /** Whether the peer reset it (once it's gone). */
+  readonly reset_by_peer: boolean;
+  /**
+   * Resolves once it's made: the guest has its RESPONSE (a guest's
+   * connection), or the guest's RESPONSE has come (one the host opens);
+   * rejects if the guest refuses it (RST) or doesn't answer in time. Its
+   * writes and shutdown wait for it.
+   */
+  readonly opened: Promise<void>;
 }
 
 interface VsockConnectionController {
@@ -155,6 +164,7 @@ function create_vsock_connection(
   let last_credit_update = 0;
   let peer_buf_alloc = DEFAULT_VSOCK_BUF_ALLOC;
   let peer_fwd_cnt = 0;
+  opened.catch(() => {});
   let write_tail = opened;
   const gone = Promise.withResolvers<void>();
 
@@ -269,11 +279,13 @@ function create_vsock_connection(
       return Math.max(0, peer_buf_alloc - ((bytes_written - peer_fwd_cnt) >>> 0));
     },
     shutdown() {
-      write_tail = write_tail.then(() => {
-        if (write_done) return;
-        end_writes();
-        ops.send(VsockOp.SHUTDOWN, VsockShutdown.SEND, new Uint8Array(), bytes_read);
-      });
+      write_tail = write_tail
+        .then(() => {
+          if (write_done) return;
+          end_writes();
+          ops.send(VsockOp.SHUTDOWN, VsockShutdown.SEND, new Uint8Array(), bytes_read);
+        })
+        .catch(() => {});
     },
     close() {
       if (closed) return;
@@ -286,6 +298,10 @@ function create_vsock_connection(
       close_from_peer();
     },
     closed: gone.promise,
+    get reset_by_peer() {
+      return reset_by_peer;
+    },
+    opened,
   };
 
   return {
@@ -359,6 +375,20 @@ export interface VsockDevice extends Device {
       seqpacket?: boolean;
     },
   ): Promise<VsockConnection>;
+  /**
+   * A connection to a vsock listener on `port` in the guest, at once (as
+   * WinterTC's connect()): its writes wait for the guest's answer, and
+   * `opened` says what it was.
+   */
+  open(
+    port: number,
+    options?: {
+      /** Connection timeout in milliseconds. Defaults to 5000. */
+      timeoutMs?: number;
+      /** A SEQPACKET connection rather than a stream. */
+      seqpacket?: boolean;
+    },
+  ): VsockConnection;
   /**
    * Listens on the host's `port` (CID 2) for the guest's connections, stream
    * or SEQPACKET alike. Connections to a port with no listener are reset.
@@ -720,46 +750,59 @@ class VirtioVsock extends VirtioDevice {
     };
   }
 
-  connect(
+  /**
+   * A connection to the guest's listener on `port`, at once: its writes
+   * held till the guest's RESPONSE (opened), refused by its RST or by no
+   * answer in time.
+   */
+  open(
     port: number,
     { timeoutMs = 5000, seqpacket = false }: { timeoutMs?: number; seqpacket?: boolean } = {},
-  ) {
-    if (this.stopped) {
-      return Promise.reject(new Error("vsock device is closed"));
-    }
-    const local_port = this.#allocate_port();
+  ): VsockConnection {
+    const made = Promise.withResolvers<void>();
+    const local_port = this.stopped ? 0 : this.#allocate_port();
     const key = key_of(local_port, port);
     const connection = create_vsock_connection(
       this.#ops(key),
       local_port,
       port,
       seqpacket ? VsockType.SEQPACKET : VsockType.STREAM,
+      made.promise,
     );
-
-    const promise = new Promise<VsockConnection>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.#send(connection, VsockOp.RST, 0, new Uint8Array());
-        this.#connections.delete(key);
-        connection.close_from_peer();
-        reject(new Error(`timed out connecting to guest vsock port ${port}`));
-      }, timeoutMs);
-
-      this.#connections.set(key, {
-        controller: connection,
-        connected: false,
-        resolve(value) {
-          clearTimeout(timeout);
-          resolve(value);
-        },
-        reject(error) {
-          clearTimeout(timeout);
-          reject(error);
-        },
-      });
+    if (this.stopped) {
+      made.reject(new Error("vsock device is closed"));
+      connection.close_from_peer();
+      return connection.connection;
+    }
+    const timeout = setTimeout(() => {
+      this.#send(connection, VsockOp.RST, 0, new Uint8Array());
+      this.#connections.delete(key);
+      connection.close_from_peer();
+      made.reject(new Error(`timed out connecting to guest vsock port ${port}`));
+    }, timeoutMs);
+    this.#connections.set(key, {
+      controller: connection,
+      connected: false,
+      resolve() {
+        clearTimeout(timeout);
+        made.resolve();
+      },
+      reject(error) {
+        clearTimeout(timeout);
+        made.reject(error);
+      },
     });
-
     this.#send(connection, VsockOp.REQUEST, 0, new Uint8Array());
-    return promise;
+    return connection.connection;
+  }
+
+  /** A connection to the guest's listener on `port`, once the guest accepts it (open's, once opened). */
+  connect(
+    port: number,
+    options?: { timeoutMs?: number; seqpacket?: boolean },
+  ): Promise<VsockConnection> {
+    const connection = this.open(port, options);
+    return connection.opened.then(() => connection);
   }
 }
 
@@ -772,6 +815,8 @@ export function vsockDevice({ guestCid = 3n }: { guestCid?: bigint } = {}): Vsoc
   return public_handle(device, {
     connect: (port: number, options?: { timeoutMs?: number; seqpacket?: boolean }) =>
       device.connect(port, options),
+    open: (port: number, options?: { timeoutMs?: number; seqpacket?: boolean }) =>
+      device.open(port, options),
     listen: (port: number, on_connection: VsockListener) => device.listen(port, on_connection),
   });
 }

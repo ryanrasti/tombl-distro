@@ -536,6 +536,34 @@ test("virtio-vsock reads a guest's close with what it sent unread as a reset", a
   await close_device(device);
 });
 
+test("virtio-vsock opens a connection to the guest at once, its writes held till the guest's RESPONSE", async () => {
+  const device = vsockDevice();
+  const guest = vsock_guest(device);
+  const connection = device.open(5000);
+  const wrote = connection.write(new Uint8Array([7]));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  // (its REQUEST alone, so far)
+  assert.deepEqual(guest.received(), [1]);
+  guest.send(2, 5000, connection.local_port);
+  await connection.opened;
+  await wrote;
+  assert.deepEqual(guest.received(), [1, 5]);
+  await close_device(device);
+});
+
+test("virtio-vsock refuses an opened connection the guest resets: opened rejects, and its writes", async () => {
+  const device = vsockDevice();
+  const guest = vsock_guest(device);
+  const connection = device.open(5001);
+  const wrote = connection.write(new Uint8Array([7]));
+  wrote.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  guest.send(3, 5001, connection.local_port);
+  await assert.rejects(connection.opened, /reset/);
+  await assert.rejects(wrote);
+  await close_device(device);
+});
+
 test("virtio reset invalidates stale chains and pending notifications", async () => {
   const reset_memory = new WebAssembly.Memory({
     initial: 1,
