@@ -97,6 +97,8 @@ export interface VsockConnection {
   close(): void;
   /** Resets the connection (RST): what's unsent or unread is dropped. */
   reset(): void;
+  /** Resolves once it's gone: closed, or reset, by either end. */
+  readonly closed: Promise<void>;
 }
 
 interface VsockConnectionController {
@@ -121,11 +123,17 @@ interface VsockConnectionOps {
   reset(): void;
 }
 
+/**
+ * A connection's state. `opened`: what its writes (and its shutdown) wait
+ * for: a guest's connection's RESPONSE, as a guest connecting resets on a
+ * packet before it.
+ */
 function create_vsock_connection(
   ops: VsockConnectionOps,
   local_port: number,
   peer_port: number,
   type: number,
+  opened: Promise<void> = Promise.resolve(),
 ): VsockConnectionController {
   const seqpacket = type === VsockType.SEQPACKET;
   const read_buffer: Uint8Array[] = [];
@@ -145,7 +153,8 @@ function create_vsock_connection(
   let last_credit_update = 0;
   let peer_buf_alloc = DEFAULT_VSOCK_BUF_ALLOC;
   let peer_fwd_cnt = 0;
-  let write_tail = Promise.resolve();
+  let write_tail = opened;
+  const gone = Promise.withResolvers<void>();
 
   function wake_credit_waiters() {
     while (credit_waiters.length > 0) credit_waiters.shift()!();
@@ -170,6 +179,7 @@ function create_vsock_connection(
     reset_by_peer = reset;
     end_reads();
     end_writes();
+    gone.resolve();
   }
 
   async function read_chunk(): Promise<Uint8Array> {
@@ -273,6 +283,7 @@ function create_vsock_connection(
       ops.reset();
       close_from_peer();
     },
+    closed: gone.promise,
   };
 
   return {
@@ -538,11 +549,14 @@ class VirtioVsock extends VirtioDevice {
       return;
     }
     const key = key_of(header.dst_port, header.src_port);
+    // (its writes held till its RESPONSE: sent, or never)
+    const opened = Promise.withResolvers<void>();
     const controller = create_vsock_connection(
       this.#ops(key),
       header.dst_port,
       header.src_port,
       header.type,
+      opened.promise,
     );
     controller.update_credit(header.buf_alloc, header.fwd_cnt);
     this.#connections.set(key, {
@@ -554,6 +568,7 @@ class VirtioVsock extends VirtioDevice {
     const accepted = listener(controller.connection);
     if (!accepted) {
       this.#send(controller, VsockOp.RESPONSE, 0, new Uint8Array());
+      opened.resolve();
       return;
     }
     // (answered once the listener says: its connection made, or not)
@@ -562,8 +577,12 @@ class VirtioVsock extends VirtioDevice {
         if (this.#connections.get(key)?.controller === controller) {
           this.#send(controller, VsockOp.RESPONSE, 0, new Uint8Array());
         }
+        opened.resolve();
       },
-      () => controller.connection.reset(),
+      () => {
+        controller.connection.reset();
+        opened.resolve();
+      },
     );
   }
 
