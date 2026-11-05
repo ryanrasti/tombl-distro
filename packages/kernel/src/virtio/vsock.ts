@@ -109,6 +109,8 @@ interface VsockConnectionController {
   readonly bytes_read: number;
   /** Both directions have finished: the peer's sending, and ours. */
   readonly finished: boolean;
+  /** What we've sent that the peer hasn't read yet (its last fwd_cnt behind it). */
+  readonly unread: number;
   update_credit(buf_alloc: number, fwd_cnt: number): void;
   enqueue(data: Uint8Array, flags: number): void;
   /** The peer's SHUTDOWN flags. */
@@ -296,6 +298,9 @@ function create_vsock_connection(
     },
     get finished() {
       return read_done && write_done;
+    },
+    get unread() {
+      return (bytes_written - peer_fwd_cnt) >>> 0;
     },
     update_credit(buf_alloc, fwd_cnt) {
       peer_buf_alloc = buf_alloc;
@@ -589,6 +594,18 @@ class VirtioVsock extends VirtioDevice {
   #handle_tx_packet(header: VsockHeader, payload: Uint8Array) {
     const key = key_of(header.dst_port, header.src_port);
     const state = this.#connections.get(key);
+    // A guest's connection anew on a port pair we still hold: it has let go
+    // of the old one (a connect it gave up, a RST still on its way), so the
+    // old one's reset and the new one taken, as Linux's transport does.
+    if (state && header.op === VsockOp.REQUEST) {
+      if (!state.connected) {
+        state.reject(new Error("guest connected again on its port"));
+      }
+      state.controller.close_from_peer(true);
+      this.#connections.delete(key);
+      this.#handle_request(header);
+      return;
+    }
     if (!state) {
       if (header.op === VsockOp.REQUEST) this.#handle_request(header);
       else if (header.op !== VsockOp.RST) {
@@ -624,13 +641,17 @@ class VirtioVsock extends VirtioDevice {
       case VsockOp.SHUTDOWN:
         connection.shutdown_from_peer(header.flags);
         // Both directions done: the connection ends, as Linux ends its side
-        // of one, with a reset.
+        // of one, with a reset. Ended with what we sent unread (its fwd_cnt
+        // behind it: a close with data unread, which vsock sends as a
+        // shutdown), it's a reset for us too, as TCP's RST.
         if (connection.finished || header.flags === (VsockShutdown.RCV | VsockShutdown.SEND)) {
           this.#send(connection, VsockOp.RST, 0, new Uint8Array());
           if (!state.connected) {
             state.reject(new Error("guest shut down vsock connection"));
           }
-          connection.close_from_peer();
+          connection.close_from_peer(
+            (header.flags & VsockShutdown.RCV) !== 0 && connection.unread > 0,
+          );
           this.#connections.delete(key);
         }
         break;

@@ -421,7 +421,7 @@ function vsock_guest(device: ReturnType<typeof vsockDevice>) {
   const view = new DataView(memory.buffer);
   const AVAIL = 1 << 7;
   const WRITE = 1 << 1;
-  // (rx: 4 descriptors at 0, their buffers at 1024; tx: 4 at 512, theirs at 4096)
+  // (rx: 4 descriptors at 0, their buffers at 1024; tx: 8 at 512, theirs at 4096)
   for (let i = 0; i < 4; i++) {
     view.setBigUint64(i * 16, BigInt(1024 + i * 256), true);
     view.setUint32(i * 16 + 8, 256, true);
@@ -429,12 +429,12 @@ function vsock_guest(device: ReturnType<typeof vsockDevice>) {
     view.setUint16(i * 16 + 14, AVAIL | WRITE, true);
   }
   imports.enable_vring(0, 0, 4, 0, 1);
-  imports.enable_vring(0, 1, 4, 512, 2);
+  imports.enable_vring(0, 1, 8, 512, 2);
   imports.notify(0, 0);
   let sent = 0;
   return {
-    /** a packet from the guest's port to the host's (CID 2) */
-    send(op: number, src_port: number, dst_port: number) {
+    /** a packet from the guest's port to the host's (CID 2): its flags, and how much the guest has read (fwd_cnt) */
+    send(op: number, src_port: number, dst_port: number, { flags = 0, fwd_cnt = 0 } = {}) {
       const at = 4096 + sent * 64;
       new Uint8Array(memory.buffer, at, 44).fill(0);
       view.setBigUint64(at, 3n, true);
@@ -443,7 +443,9 @@ function vsock_guest(device: ReturnType<typeof vsockDevice>) {
       view.setUint32(at + 20, dst_port, true);
       view.setUint16(at + 28, 1, true);
       view.setUint16(at + 30, op, true);
+      view.setUint32(at + 32, flags, true);
       view.setUint32(at + 36, 65536, true);
+      view.setUint32(at + 40, fwd_cnt, true);
       const d = 512 + sent * 16;
       view.setBigUint64(d, BigInt(at), true);
       view.setUint32(d + 8, 44, true);
@@ -495,6 +497,42 @@ test("virtio-vsock says when a connection is gone (closed)", async () => {
   guest.send(3, 5000, 1234);
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(gone, true);
+  await close_device(device);
+});
+
+test("virtio-vsock takes a guest's connection anew on a port pair it still holds, the old one reset", async () => {
+  const device = vsockDevice();
+  const connections: { closed: Promise<void>; read(): Promise<Uint8Array> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  guest.send(1, 1023, 1234);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  // (the guest's port again, its old connection let go of on its side)
+  guest.send(1, 1023, 1234);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(connections.length, 2);
+  assert.deepEqual(guest.received(), [2, 2]);
+  await connections[0]!.closed;
+  await assert.rejects(connections[0]!.read(), /reset/);
+  await close_device(device);
+});
+
+test("virtio-vsock reads a guest's close with what it sent unread as a reset", async () => {
+  const device = vsockDevice();
+  const connections: { write(d: Uint8Array): Promise<void>; read(): Promise<Uint8Array> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  // (one connection closed with the host's byte unread, one with it read)
+  guest.send(1, 1000, 1234);
+  guest.send(1, 1001, 1234);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await connections[0]!.write(new Uint8Array([7]));
+  await connections[1]!.write(new Uint8Array([7]));
+  guest.send(4, 1000, 1234, { flags: 3, fwd_cnt: 0 });
+  guest.send(4, 1001, 1234, { flags: 3, fwd_cnt: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await assert.rejects(connections[0]!.read(), /reset/);
+  assert.equal((await connections[1]!.read()).byteLength, 0);
   await close_device(device);
 });
 
