@@ -160,6 +160,8 @@ function create_vsock_connection(
   /** The peer reset it: reads fail once what came before is read. */
   let reset_by_peer = false;
   let bytes_read = 0;
+  /** What's come and not been read, a message in progress's too: at most our buf_alloc from a guest that keeps to its credit. */
+  let unread = 0;
   let bytes_written = 0;
   let last_credit_update = 0;
   let peer_buf_alloc = DEFAULT_VSOCK_BUF_ALLOC;
@@ -205,6 +207,7 @@ function create_vsock_connection(
   }
 
   function consume(length: number) {
+    unread -= length;
     bytes_read = (bytes_read + length) >>> 0;
     const consumed = (bytes_read - last_credit_update) >>> 0;
     if (consumed >= DEFAULT_VSOCK_BUF_ALLOC / 4 && !closed) {
@@ -325,6 +328,15 @@ function create_vsock_connection(
     },
     enqueue(payload, flags) {
       if (read_done) return;
+      unread += payload.byteLength;
+      // A guest past the credit we gave it: what it holds here has a bound.
+      if (unread > DEFAULT_VSOCK_BUF_ALLOC) {
+        read_buffer.length = 0;
+        message = [];
+        ops.reset();
+        close_from_peer(true);
+        return;
+      }
       // (a copy: the payload is a view of the guest's buffer, which it reuses)
       let data = payload.slice();
       if (seqpacket) {
