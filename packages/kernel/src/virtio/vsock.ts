@@ -473,9 +473,19 @@ class VirtioVsock extends VirtioDevice {
 
   /**
    * Pending packets into the guest's receive buffers, written in place: a
-   * payload larger than a buffer split across buffers, a packet each.
+   * payload larger than a buffer split across buffers, a packet each. A
+   * malformed buffer fails the device: this runs for the host's callers
+   * too, which it mustn't throw to.
    */
   #flush() {
+    try {
+      this.#deliver();
+    } catch (error) {
+      this.spawn(Promise.reject(error));
+    }
+  }
+
+  #deliver() {
     while (
       this.#pending.length > 0 &&
       this.#rx.deliver((chain) => {
