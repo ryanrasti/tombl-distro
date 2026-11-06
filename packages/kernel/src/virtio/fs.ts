@@ -32,6 +32,7 @@ const FuseOpcode = {
   STATFS: 17,
   RELEASE: 18,
   FSYNC: 20,
+  GETXATTR: 22,
   FLUSH: 25,
   INIT: 26,
   OPENDIR: 27,
@@ -358,6 +359,8 @@ export interface FS<TNode, THandle> {
   ): MaybePromise<Iterable<FSDirectoryEntry<TNode>> | AsyncIterable<FSDirectoryEntry<TNode>>>;
   releasedir?(node: TNode, handle: THandle): MaybePromise<void>;
   access?(node: TNode, mask: number): MaybePromise<void>;
+  /** An extended attribute's value, or undefined if the node hasn't one. */
+  getxattr?(node: TNode, name: string): MaybePromise<Uint8Array | undefined>;
   statfs?(node: TNode): MaybePromise<FSStat>;
   destroy?(): MaybePromise<void>;
 }
@@ -613,6 +616,16 @@ const FuseReleaseIn = Struct({
 
 const FuseAccessIn = Struct({
   mask: U32LE,
+  padding: U32LE,
+});
+
+const FuseGetxattrIn = Struct({
+  size: U32LE,
+  padding: U32LE,
+});
+
+const FuseGetxattrOut = Struct({
+  size: U32LE,
   padding: U32LE,
 });
 
@@ -1474,6 +1487,19 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         const request = body.struct(FuseAccessIn);
         if (filesystem.access) await filesystem.access(node!.node, request.mask);
         break;
+      }
+      case FuseOpcode.GETXATTR: {
+        if (!filesystem.getxattr) throw new UnsupportedOperation();
+        const request = body.struct(FuseGetxattrIn);
+        const value = await filesystem.getxattr(node!.node, body.cstring());
+        if (!value) throw new FSError("ENODATA");
+        // A size of 0 asks only how long the value is.
+        if (!request.size) {
+          payload.alloc(FuseGetxattrOut).value = { size: value.byteLength, padding: 0 };
+          break;
+        }
+        if (value.byteLength > request.size) throw new FSError("ERANGE");
+        return value;
       }
       case FuseOpcode.INTERRUPT:
         return undefined;
