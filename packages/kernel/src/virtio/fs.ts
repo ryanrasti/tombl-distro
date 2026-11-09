@@ -387,10 +387,7 @@ export interface FS<TNode, THandle> {
    * A directory's names, without "." and "..": the device looks each one up
    * (`entry`, else `lookup` and `getattr`) as it lists it.
    */
-  readdir?(
-    node: TNode,
-    handle: THandle,
-  ): MaybePromise<Iterable<string> | AsyncIterable<string>>;
+  readdir?(node: TNode, handle: THandle): MaybePromise<Iterable<string> | AsyncIterable<string>>;
   releasedir?(node: TNode, handle: THandle): MaybePromise<void>;
   access?(node: TNode, mask: number): MaybePromise<void>;
   /** An extended attribute's value, or undefined if the node hasn't one. */
@@ -1329,7 +1326,11 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         if (!filesystem.link) throw new UnsupportedOperation();
         const request = body.struct(FuseLinkIn);
         const target = node_record(request.oldnodeid);
-        const linked = await filesystem.link(target.node, node!.node, validate_name(body.cstring()));
+        const linked = await filesystem.link(
+          target.node,
+          node!.node,
+          validate_name(body.cstring()),
+        );
         const record = record_for_node(linked, node!);
         record.lookups += 1n;
         write_entry(payload, record, await filesystem.getattr(linked), validity);
@@ -1496,7 +1497,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           directory.listing = names;
         }
         const names = directory.listing;
-        const name_at = (index: number) => (index === 0 ? "." : index === 1 ? ".." : names[index - 2]!);
+        const name_at = (index: number) =>
+          index === 0 ? "." : index === 1 ? ".." : names[index - 2]!;
         // FUSE dirents are padded to 8 bytes: 24-byte header + name, after
         // READDIRPLUS's entry. The names that fit are looked up together.
         const record_length = (encoded: Uint8Array) =>
@@ -1509,7 +1511,9 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         }
         const first = Math.max(offset, 2);
         const { found, failure } =
-          end > first ? await entries_of(directory, names.slice(first - 2, end - 2)) : { found: [] };
+          end > first
+            ? await entries_of(directory, names.slice(first - 2, end - 2))
+            : { found: [] };
         for (let index = offset; index < end; index++) {
           const encoded = utf8_encoder.encode(name_at(index));
           let ino: bigint;

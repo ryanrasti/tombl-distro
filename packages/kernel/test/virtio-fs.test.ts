@@ -29,7 +29,7 @@ const Opcode = {
 function direntsplus(payload: Uint8Array) {
   const result: [string, bigint, bigint][] = [];
   const data = view(payload);
-  for (let at = 0; at < payload.byteLength; ) {
+  for (let at = 0; at < payload.byteLength;) {
     const nodeid = data.getBigUint64(at, true);
     const dirent = at + 128;
     const length = data.getUint32(dirent + 16, true);
@@ -44,13 +44,21 @@ const view = (bytes: Uint8Array) => new DataView(bytes.buffer, bytes.byteOffset,
 const getattr_in = () => body(["u32", 0], ["u32", 0], ["u64", 0n]);
 const open_in = (flags = 0) => body(["u32", flags], ["u32", 0]);
 const read_in = (fh: bigint, offset: bigint, size: number) =>
-  body(["u64", fh], ["u64", offset], ["u32", size], ["u32", 0], ["u64", 0n], ["u32", 0], ["u32", 0]);
+  body(
+    ["u64", fh],
+    ["u64", offset],
+    ["u32", size],
+    ["u32", 0],
+    ["u64", 0n],
+    ["u32", 0],
+    ["u32", 0],
+  );
 
 /** The (name, ino) of each dirent in a READDIR reply. */
 function dirents(payload: Uint8Array) {
   const result: [string, bigint][] = [];
   const data = view(payload);
-  for (let at = 0; at < payload.byteLength; ) {
+  for (let at = 0; at < payload.byteLength;) {
     const length = data.getUint32(at + 16, true);
     const name = new TextDecoder().decode(payload.subarray(at + 24, at + 24 + length));
     result.push([name, data.getBigUint64(at, true)]);
@@ -82,7 +90,8 @@ test("virtio-fs gives the guest a backend error's Linux errno", async () => {
       },
     }),
   );
-  const getattr = () => harness.request(Opcode.GETATTR, ROOT, body(["u32", 0], ["u32", 0], ["u64", 0n]));
+  const getattr = () =>
+    harness.request(Opcode.GETATTR, ROOT, body(["u32", 0], ["u32", 0], ["u64", 0n]));
 
   thrown = new FSError("ESTALE");
   assert.equal((await getattr()).error, -116);
@@ -92,7 +101,10 @@ test("virtio-fs gives the guest a backend error's Linux errno", async () => {
   // A malformed request: its body cut short.
   assert.equal((await harness.request(Opcode.GETATTR, ROOT, body(["u32", 0]))).error, -22);
   // A node that isn't there, nodeid 0 too.
-  assert.equal((await harness.request(Opcode.GETATTR, 0n, body(["u32", 0], ["u32", 0], ["u64", 0n]))).error, -2);
+  assert.equal(
+    (await harness.request(Opcode.GETATTR, 0n, body(["u32", 0], ["u32", 0], ["u64", 0n]))).error,
+    -2,
+  );
   // Anything else isn't the guest's: it fails the machine.
   thrown = new TypeError("unexpected");
   await assert.rejects(getattr(), /unexpected/);
@@ -131,7 +143,9 @@ test("virtio-fs reports a backend's inode numbers and asks it attributes once a 
   const harness = new FuseHarness(
     filesystem({
       entry: (_parent, name) =>
-        name === "f" ? { node: file, attributes: { mode: 0o100644, size: 3n, ino: 77n } } : undefined,
+        name === "f"
+          ? { node: file, attributes: { mode: 0o100644, size: 3n, ino: 77n } }
+          : undefined,
       getattr: (node) => {
         getattrs += 1;
         return node === file ? { mode: 0o100644, size: 3n, ino: 77n } : { ...directory, ino: 5n };
@@ -202,7 +216,10 @@ test("virtio-fs serves hard links, mknod, rename flags, fallocate, syncfs and fs
       lookup: (_parent, name) => (name === "f" ? file : undefined),
       getattr: (node) => (node === file ? { mode: 0o100644, size: 0n, nlink: 2 } : directory),
       link: (node, _parent, name) => (calls.push(["link", node, name]), node),
-      mknod: (_parent, name, rdev, context) => (calls.push(["mknod", name, rdev, context.mode]), file),
+      mknod: (_parent, name, rdev, context) => (
+        calls.push(["mknod", name, rdev, context.mode]),
+        file
+      ),
       rename: (_from, from, _to, to, flags) => void calls.push(["rename", from, to, flags]),
       open: () => "handle",
       opendir: () => "dir",
@@ -234,7 +251,10 @@ test("virtio-fs serves hard links, mknod, rename flags, fallocate, syncfs and fs
   );
   assert.equal(renamed.error, 0);
 
-  const fh = view((await harness.request(Opcode.OPEN, nodeid, open_in())).payload).getBigUint64(0, true);
+  const fh = view((await harness.request(Opcode.OPEN, nodeid, open_in())).payload).getBigUint64(
+    0,
+    true,
+  );
   const allocated = await harness.request(
     Opcode.FALLOCATE,
     nodeid,
@@ -242,8 +262,15 @@ test("virtio-fs serves hard links, mknod, rename flags, fallocate, syncfs and fs
   );
   assert.equal(allocated.error, 0);
   assert.equal((await harness.request(Opcode.SYNCFS, ROOT, body(["u64", 0n]))).error, 0);
-  const dir = view((await harness.request(Opcode.OPENDIR, ROOT, open_in())).payload).getBigUint64(0, true);
-  const synced = await harness.request(Opcode.FSYNCDIR, ROOT, body(["u64", dir], ["u32", 0], ["u32", 0]));
+  const dir = view((await harness.request(Opcode.OPENDIR, ROOT, open_in())).payload).getBigUint64(
+    0,
+    true,
+  );
+  const synced = await harness.request(
+    Opcode.FSYNCDIR,
+    ROOT,
+    body(["u64", dir], ["u32", 0], ["u32", 0]),
+  );
   assert.equal(synced.error, 0);
 
   assert.deepEqual(calls, [
@@ -258,7 +285,12 @@ test("virtio-fs serves hard links, mknod, rename flags, fallocate, syncfs and fs
 });
 
 test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what it has on an error", async () => {
-  const nodes = { a: { name: "a" }, b: { name: "b" }, gone: { name: "gone" }, bad: { name: "bad" } };
+  const nodes = {
+    a: { name: "a" },
+    b: { name: "b" },
+    gone: { name: "gone" },
+    bad: { name: "bad" },
+  };
   const forgotten: object[] = [];
   let names = ["a", "gone", "b"];
   const harness = new FuseHarness(
@@ -276,7 +308,10 @@ test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what
     }),
   );
   await harness.request(Opcode.GETATTR, ROOT, getattr_in());
-  const dir = view((await harness.request(Opcode.OPENDIR, ROOT, open_in())).payload).getBigUint64(0, true);
+  const dir = view((await harness.request(Opcode.OPENDIR, ROOT, open_in())).payload).getBigUint64(
+    0,
+    true,
+  );
 
   const listing = await harness.request(Opcode.READDIRPLUS, ROOT, read_in(dir, 0n, 4096));
   assert.equal(listing.error, 0);
@@ -334,7 +369,11 @@ test("virtio-fs holds a FORGET that comes while a request is in progress till it
   assert.deepEqual(forgotten, [], "not while the lookup is in progress");
   gate.resolve();
   gate = undefined;
-  assert.equal(view((await again).payload).getBigUint64(0, true), nodeid, "the same node, still known");
+  assert.equal(
+    view((await again).payload).getBigUint64(0, true),
+    nodeid,
+    "the same node, still known",
+  );
   assert.deepEqual(forgotten, []);
   await harness.forget(nodeid, 1n);
   assert.deepEqual(forgotten, [file]);
@@ -397,10 +436,18 @@ test("virtio-fs ends each session at its DESTROY: a mount again starts afresh", 
 test("FSError.from gives a backend the errno the device would give the guest", () => {
   const system = (code: string) => Object.assign(new Error("x"), { code, syscall: "open" });
   assert.equal(FSError.from(system("EMFILE"))?.errno, 24);
-  assert.equal(FSError.from(system("EUNHEARD"))?.errno, 5, "a host call's failure Linux has no name for");
+  assert.equal(
+    FSError.from(system("EUNHEARD"))?.errno,
+    5,
+    "a host call's failure Linux has no name for",
+  );
   assert.equal(FSError.from(new FSError("EBUSY"))?.errno, 16);
   assert.equal(FSError.from(new TypeError("a bug")), undefined, "no filesystem's failure");
-  assert.equal(FSError.from(Object.assign(new Error("x"), { code: "EMFILE" })), undefined, "not a host call's");
+  assert.equal(
+    FSError.from(Object.assign(new Error("x"), { code: "EMFILE" })),
+    undefined,
+    "not a host call's",
+  );
   assert.equal(new FSError(72).errno, 72);
 });
 
@@ -414,7 +461,8 @@ test("virtio-fs passes each request's work through the host's host_work, until i
       return value;
     });
   });
-  const getattr = () => harness.request(Opcode.GETATTR, ROOT, body(["u32", 0], ["u32", 0], ["u64", 0n]));
+  const getattr = () =>
+    harness.request(Opcode.GETATTR, ROOT, body(["u32", 0], ["u32", 0], ["u64", 0n]));
   assert.equal((await getattr()).error, 0);
   replied = true;
   assert.equal(works.length, 1);

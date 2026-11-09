@@ -249,7 +249,11 @@ export interface NodeFSOptions {
  * otherwise. A host filesystem that can't chmod (vfat, some network ones:
  * EPERM, ENOTSUP) keeps what it made rather than failing the request.
  */
-async function settle(have: bigint | number, want: number, change: (mode: number) => Promise<void>) {
+async function settle(
+  have: bigint | number,
+  want: number,
+  change: (mode: number) => Promise<void>,
+) {
   if ((Number(have) & 0o7777) === (want & 0o7777)) return;
   await change(want & 0o7777).catch((error: { code?: string }) => {
     if (error.code !== "EPERM" && error.code !== "ENOTSUP" && error.code !== "EOPNOTSUPP") {
@@ -708,7 +712,11 @@ export class NodeFS implements FS<Node, Handle> {
    */
   async #create(at: string, flags: number, mode: number, exclusive: boolean) {
     try {
-      const file = await open(at, flags | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, mode);
+      const file = await open(
+        at,
+        flags | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        mode,
+      );
       try {
         await settle((await file.stat({ bigint: true })).mode, mode, (m) => file.chmod(m));
       } catch (error) {
@@ -825,7 +833,9 @@ export class NodeFS implements FS<Node, Handle> {
    * here is synced: what it wrote through them, at least, is durable.
    */
   async syncfs() {
-    await Promise.all([...this.#open].map((handle) => handle.file && node_call(handle.file.sync())));
+    await Promise.all(
+      [...this.#open].map((handle) => handle.file && node_call(handle.file.sync())),
+    );
   }
 
   async release(_node: Node, handle: Handle) {

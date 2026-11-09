@@ -163,10 +163,16 @@ test("node virtio-fs adapter gives a new node to a new file on a removed one's i
   const next = await filesystem.mkdir!(filesystem.root, "e", { mode: 0o755, ...owner });
   assert.notEqual(next, directory);
 
-  const old = await filesystem.create!(filesystem.root, "f", linux_open.writeonly, { mode: 0o644, ...owner });
+  const old = await filesystem.create!(filesystem.root, "f", linux_open.writeonly, {
+    mode: 0o644,
+    ...owner,
+  });
   await filesystem.release!(old.node, old.handle);
   await filesystem.unlink!(filesystem.root, "f");
-  const replacement = await filesystem.create!(filesystem.root, "g", linux_open.writeonly, { mode: 0o644, ...owner });
+  const replacement = await filesystem.create!(filesystem.root, "g", linux_open.writeonly, {
+    mode: 0o644,
+    ...owner,
+  });
   await filesystem.release!(replacement.node, replacement.handle);
   assert.notEqual(replacement.node, old.node);
 });
@@ -285,7 +291,8 @@ async function fresh() {
 
 const context = (mode: number) => ({ mode, uid: process.getuid!(), gid: process.getgid!() });
 
-const errno = (code: number) => (error: unknown) => error instanceof FSError && error.errno === code;
+const errno = (code: number) => (error: unknown) =>
+  error instanceof FSError && error.errno === code;
 
 async function read_all(filesystem: NodeFS, node: object) {
   const handle = await filesystem.open!(node as never, linux_open.readonly);
@@ -326,7 +333,11 @@ test("node virtio-fs adapter keeps a file by any of its names", async () => {
   const { share } = await fresh();
   const filesystem = new NodeFS(share);
   const file = await node_at(filesystem, "file");
-  assert.equal(await filesystem.link!(file, filesystem.root, "other"), file, "a link is the same node");
+  assert.equal(
+    await filesystem.link!(file, filesystem.root, "other"),
+    file,
+    "a link is the same node",
+  );
   await filesystem.unlink!(filesystem.root, "file");
   assert.equal(await read_all(filesystem, file), "inside\n");
   // The host renamed it: no name known to hold it, until it's looked up again.
@@ -398,7 +409,11 @@ test("node virtio-fs adapter keeps a setgid parent's setgid on mkdir, as Linux's
   await mkdir(path.join(share, "p"));
   await chmod(path.join(share, "p"), 0o2775);
   const filesystem = new NodeFS(share);
-  await filesystem.mkdir!(await node_at(filesystem, "p"), "child", context(constants.S_IFDIR | 0o755));
+  await filesystem.mkdir!(
+    await node_at(filesystem, "p"),
+    "child",
+    context(constants.S_IFDIR | 0o755),
+  );
   assert.equal((await stat(path.join(share, "p", "child"))).mode & 0o7777, 0o2755);
 });
 
@@ -482,8 +497,7 @@ test("node virtio-fs adapter lists a directory as it is now each time", async ()
   const { share } = await fresh();
   const filesystem = new NodeFS(share);
   const handle = await filesystem.opendir!(filesystem.root, 0);
-  const names = async () =>
-    [...(await filesystem.readdir!(filesystem.root, handle))].sort();
+  const names = async () => [...(await filesystem.readdir!(filesystem.root, handle))].sort();
   assert.deepEqual(await names(), ["file"]);
   await writeFile(path.join(share, "new"), "");
   assert.deepEqual(await names(), ["file", "new"]);

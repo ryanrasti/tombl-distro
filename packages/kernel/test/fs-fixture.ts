@@ -117,7 +117,11 @@ export class FuseHarness {
     return {
       error: response.getInt32(4, true),
       unique: response.getBigUint64(8, true),
-      payload: new Uint8Array(this.memory.buffer, RESPONSE + 16, Math.max(0, reply_length - 16)).slice(),
+      payload: new Uint8Array(
+        this.memory.buffer,
+        RESPONSE + 16,
+        Math.max(0, reply_length - 16),
+      ).slice(),
     } satisfies FuseReply;
   }
 
