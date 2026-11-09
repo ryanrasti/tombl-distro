@@ -448,7 +448,9 @@ function vsock_guest(device: ReturnType<typeof vsockDevice>) {
         length = payload.byteLength,
       } = {},
     ) {
-      const at = 4096 + sent * 64;
+      // (the ring of 8 taken round: a slot each, its flags the lap's)
+      const slot = sent % 8;
+      const at = 4096 + slot * 64;
       new Uint8Array(memory.buffer, at, 44).fill(0);
       new Uint8Array(memory.buffer, at + 44, payload.byteLength).set(payload);
       view.setUint32(at + 24, length, true);
@@ -461,13 +463,18 @@ function vsock_guest(device: ReturnType<typeof vsockDevice>) {
       view.setUint32(at + 32, flags, true);
       view.setUint32(at + 36, buf_alloc, true);
       view.setUint32(at + 40, fwd_cnt, true);
-      const d = 512 + sent * 16;
+      const d = 512 + slot * 16;
       view.setBigUint64(d, BigInt(at), true);
       view.setUint32(d + 8, 44 + length, true);
-      view.setUint16(d + 12, sent, true);
-      view.setUint16(d + 14, AVAIL, true);
+      view.setUint16(d + 12, slot, true);
+      view.setUint16(d + 14, Math.floor(sent / 8) % 2 === 0 ? AVAIL : 1 << 15, true);
       sent++;
       imports.notify(0, 1);
+    },
+    /** its 4 receive buffers posted again, for the ring's second lap */
+    post_rx() {
+      for (let i = 0; i < 4; i++) view.setUint16(i * 16 + 14, (1 << 15) | WRITE, true);
+      imports.notify(0, 0);
     },
     /** the ops of the packets the device has put in the guest's buffers, in order */
     received() {
@@ -612,6 +619,20 @@ test("virtio-vsock refuses a SEQPACKET message larger than the guest's buffer: E
   await new Promise((resolve) => setTimeout(resolve, 10));
   await assert.rejects(connections[0]!.write(new Uint8Array(1001)), { code: "EMSGSIZE" });
   await connections[0]!.write(new Uint8Array(1000));
+  await close_device(device);
+});
+
+test("virtio-vsock reads the guest's packets no further while its replies fill the receive queue", async () => {
+  const device = vsockDevice();
+  let accepted = 0;
+  device.listen(1234, () => void (accepted += 1));
+  const guest = vsock_guest(device);
+  // (68 to ports no one listens on: 4 RSTs in the guest's buffers, 64 waiting)
+  for (let i = 0; i < 68; i++) guest.send(1, 6000 + i, 4321);
+  for (let i = 0; i < 4; i++) guest.send(1, 7000 + i, 1234);
+  assert.equal(accepted, 0, "not read while 64 replies wait");
+  guest.post_rx();
+  assert.equal(accepted, 4, "read once the guest takes some");
   await close_device(device);
 });
 

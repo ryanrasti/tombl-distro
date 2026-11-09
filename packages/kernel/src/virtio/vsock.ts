@@ -456,9 +456,15 @@ const key_of = (local_port: number, peer_port: number) => `${local_port}:${peer_
 class VirtioVsock extends VirtioDevice {
   readonly #guest_cid: bigint;
   readonly #rx = new RxQueue();
-  // Packets are small and bounded by the peer's credit, so they queue here
-  // until the guest posts buffers for them.
+  // Packets wait here for the guest's receive buffers. Data is bounded by
+  // the peer's credit; control packets (replies to the guest's packets
+  // among them) by the receive queue's size: the guest's packets are read
+  // no further while that many wait, as vhost's.
   readonly #pending: PendingPacket[] = [];
+  /** The control packets (all but RW) among them. */
+  #controls = 0;
+  /** The guest's transmit queue, as its last kick gave it. */
+  #tx: Virtqueue | undefined;
   readonly #connections = new Map<string, VsockConnectionState>();
   readonly #listeners = new Map<number, VsockListener>();
   #next_port = 49152;
@@ -532,7 +538,7 @@ class VirtioVsock extends VirtioDevice {
         hdr.setUint32(36, DEFAULT_VSOCK_BUF_ALLOC, true);
         hdr.setUint32(40, packet.fwd_cnt, true);
         desc.array.set(packet.payload.subarray(0, n), VsockHeader.size);
-        if (last) this.#pending.shift();
+        if (last && this.#pending.shift()!.op !== VsockOp.RW) this.#controls -= 1;
         else packet.payload = packet.payload.subarray(n);
         return VsockHeader.size + n;
       })
@@ -549,6 +555,7 @@ class VirtioVsock extends VirtioDevice {
     fwd_cnt: number,
   ) {
     this.#pending.push({ local_port, peer_port, type, op, flags, fwd_cnt, payload });
+    if (op !== VsockOp.RW) this.#controls += 1;
     this.#flush();
   }
 
@@ -733,22 +740,34 @@ class VirtioVsock extends VirtioDevice {
       case 0:
         this.#rx.post(queue);
         this.#flush();
+        this.#read_tx();
         break;
       case 1:
-        for (const chain of queue) {
-          const { header, payload } = read_tx_packet(chain);
-          this.#handle_tx_packet(header, payload);
-          chain.release(0);
-        }
+        this.#tx = queue;
+        this.#read_tx();
         break;
       // Event buffers (queue 2) are only needed for host transport reset,
       // which is not supported yet.
     }
   }
 
+  /** The guest's packets, while the control packets waiting for its receive buffers are fewer than its receive queue holds. */
+  #read_tx() {
+    const chains = this.#tx?.[Symbol.iterator]();
+    while (chains && this.#controls < this.queue_size) {
+      const next = chains.next();
+      if (next.done) return;
+      const { header, payload } = read_tx_packet(next.value);
+      this.#handle_tx_packet(header, payload);
+      next.value.release(0);
+    }
+  }
+
   protected reset() {
     this.#rx.reset();
     this.#pending.length = 0;
+    this.#controls = 0;
+    this.#tx = undefined;
     for (const state of this.#connections.values()) {
       if (!state.connected) {
         state.reject(new Error("vsock device reset while connecting"));
