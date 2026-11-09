@@ -374,7 +374,7 @@ test("node virtio-fs adapter lists names, and gives a lookup's attributes with i
   const { share } = await fresh();
   await mkdir(path.join(share, "d"));
   const filesystem = new NodeFS(share);
-  const handle = await filesystem.opendir!(filesystem.root, 0);
+  const handle = await filesystem.opendir!(filesystem.root);
   const names = [...(await filesystem.readdir!(filesystem.root, handle))];
   await filesystem.releasedir!(filesystem.root, handle);
   assert.deepEqual(names.sort(), ["d", "file"]);
@@ -429,7 +429,7 @@ test("node virtio-fs adapter lists a directory once per readdir, not at opendir"
   }) as typeof original;
   syncBuiltinESMExports();
   try {
-    const handle = await filesystem.opendir!(filesystem.root, 0);
+    const handle = await filesystem.opendir!(filesystem.root);
     await filesystem.readdir!(filesystem.root, handle);
     await filesystem.releasedir!(filesystem.root, handle);
   } finally {
@@ -486,7 +486,7 @@ test("node virtio-fs adapter closes everything at destroy, and caps how much is 
   const filesystem = new NodeFS(share, { maxOpen: 2 });
   const file = await node_at(filesystem, "file");
   const handle = await filesystem.open!(file, linux_open.readonly);
-  await filesystem.opendir!(filesystem.root, 0);
+  await filesystem.opendir!(filesystem.root);
   await assert.rejects(filesystem.open!(file, linux_open.readonly), errno(24));
   await filesystem.destroy!();
   await assert.rejects(filesystem.read!(file, handle, 0n, 1), errno(9));
@@ -496,7 +496,7 @@ test("node virtio-fs adapter closes everything at destroy, and caps how much is 
 test("node virtio-fs adapter lists a directory as it is now each time", async () => {
   const { share } = await fresh();
   const filesystem = new NodeFS(share);
-  const handle = await filesystem.opendir!(filesystem.root, 0);
+  const handle = await filesystem.opendir!(filesystem.root);
   const names = async () => [...(await filesystem.readdir!(filesystem.root, handle))].sort();
   assert.deepEqual(await names(), ["file"]);
   await writeFile(path.join(share, "new"), "");
@@ -507,7 +507,7 @@ test("node virtio-fs adapter lists a directory as it is now each time", async ()
 test("node virtio-fs adapter fsyncs directories, syncs the filesystem, and fallocates", async () => {
   const { share } = await fresh();
   const filesystem = new NodeFS(share);
-  const directory = await filesystem.opendir!(filesystem.root, 0);
+  const directory = await filesystem.opendir!(filesystem.root);
   await filesystem.fsyncdir!(filesystem.root, directory, false);
   const file = await node_at(filesystem, "file");
   const handle = await filesystem.open!(file, linux_open.readwrite);
@@ -586,7 +586,7 @@ test("node virtio-fs adapter closes everything at destroy even once the share is
   const filesystem = new NodeFS(share);
   const file = await node_at(filesystem, "file");
   const handle = await filesystem.open!(file, linux_open.readonly);
-  const listing = await filesystem.opendir!(filesystem.root, 0);
+  const listing = await filesystem.opendir!(filesystem.root);
   await rm(directory, { recursive: true, force: true });
   await filesystem.destroy!();
   await assert.rejects(filesystem.read!(file, handle, 0n, 1), errno(9));
