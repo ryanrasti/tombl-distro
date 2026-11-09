@@ -339,9 +339,7 @@ globalThis.opfsVirtioFileSystem = async () => {
   await filesystem.rename(filesystem.root, "hello", filesystem.root, "renamed");
   const entries = (
     await filesystem.readdir(filesystem.root, await filesystem.opendir(filesystem.root))
-  )
-    .map((entry) => entry.name)
-    .sort();
+  ).sort();
 
   const reopened = new BrowserFS(directory);
   const node = await reopened.lookup(reopened.root, "renamed");

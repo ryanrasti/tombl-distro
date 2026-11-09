@@ -33,7 +33,6 @@ import {
   type FS,
   type FSAttributes,
   type FSCreateContext,
-  type FSDirectoryEntry,
   type FSEntry,
   FSError,
   type FSSetAttributes,
@@ -466,14 +465,24 @@ export class NodeFS implements FS<Node, Handle> {
   }
 
   async entry(parent: Node, name: string) {
+    return (await this.entries(parent, [name]))[0];
+  }
+
+  /** Names in a directory node: each one's entry, undefined if it isn't there; the directory checked once. */
+  async entries(parent: Node, names: readonly string[]) {
     return await this.#path_operation(async () => {
-      const at = await this.#child(parent, name);
-      try {
-        return await this.#entry(at);
-      } catch (error) {
-        if (FSError.from(error).errno === ENOENT) return undefined;
-        throw error;
-      }
+      const [at, stats] = await this.#where(parent);
+      if (!stats.isDirectory()) throw new FSError("ENOTDIR");
+      return await Promise.all(
+        names.map(async (name) => {
+          try {
+            return await this.#entry(this.#below(at, name));
+          } catch (error) {
+            if (FSError.from(error).errno === ENOENT) return undefined;
+            throw error;
+          }
+        }),
+      );
     });
   }
 
@@ -821,24 +830,12 @@ export class NodeFS implements FS<Node, Handle> {
     });
   }
 
-  /**
-   * The directory's entries now, each with its attributes (each lstat'd: a
-   * Dirent has no inode, which the guest's listing shows).
-   */
-  async readdir(node: Node, _handle: Handle): Promise<FSDirectoryEntry<Node>[]> {
+  /** The directory's names now. */
+  async readdir(node: Node, _handle: Handle) {
     return await this.#path_operation(async () => {
-      const [at] = await this.#where(node);
-      const names = await readdir(at);
-      const entries = await Promise.all(
-        names.map(async (name) => {
-          const child = this.#below(at, name);
-          const stats = await lstat(child, { bigint: true }).catch(() => null);
-          // (gone since the listing: left out)
-          if (!stats) return undefined;
-          return { name, node: this.#node_for(stats, child), attributes: this.#attributes(stats) };
-        }),
-      );
-      return entries.filter((entry) => entry !== undefined);
+      const [at, stats] = await this.#where(node);
+      if (!stats.isDirectory()) throw new FSError("ENOTDIR");
+      return await readdir(at);
     });
   }
 

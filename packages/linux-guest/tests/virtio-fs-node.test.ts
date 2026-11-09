@@ -359,21 +359,18 @@ test("node virtio-fs adapter shows the owner given, and ignores changes of owner
   assert.equal((await stat(path.join(share, "file"))).uid, process.getuid!());
 });
 
-test("node virtio-fs adapter lists entries with their attributes, the host's inode numbers", async () => {
+test("node virtio-fs adapter lists names, and gives a lookup's attributes with its node, the host's inode numbers", async () => {
   const { share } = await fresh();
   await mkdir(path.join(share, "d"));
   const filesystem = new NodeFS(share);
   const handle = await filesystem.opendir!(filesystem.root, 0);
-  const entries = [...(await filesystem.readdir!(filesystem.root, handle))];
+  const names = [...(await filesystem.readdir!(filesystem.root, handle))];
   await filesystem.releasedir!(filesystem.root, handle);
-  assert.deepEqual(entries.map((entry) => entry.name).sort(), ["d", "file"]);
-  const file = entries.find((entry) => entry.name === "file")!;
-  assert.equal(file.attributes?.ino, (await stat(path.join(share, "file"), { bigint: true })).ino);
-  assert.equal(file.attributes!.mode & constants.S_IFMT, constants.S_IFREG);
-  // A lookup's attributes come with its node, the inode the host's.
+  assert.deepEqual(names.sort(), ["d", "file"]);
   const entry = await filesystem.entry!(filesystem.root, "file");
-  assert.equal(entry?.node, file.node);
-  assert.equal(entry?.attributes.ino, file.attributes?.ino);
+  assert.equal(entry?.attributes.ino, (await stat(path.join(share, "file"), { bigint: true })).ino);
+  assert.equal(entry!.attributes.mode & constants.S_IFMT, constants.S_IFREG);
+  assert.equal((await filesystem.entry!(filesystem.root, "file"))?.node, entry!.node);
 });
 
 test("node virtio-fs adapter makes files with the guest's mode, not the host process's umask", async () => {
@@ -486,7 +483,7 @@ test("node virtio-fs adapter lists a directory as it is now each time", async ()
   const filesystem = new NodeFS(share);
   const handle = await filesystem.opendir!(filesystem.root, 0);
   const names = async () =>
-    [...(await filesystem.readdir!(filesystem.root, handle))].map((entry) => entry.name).sort();
+    [...(await filesystem.readdir!(filesystem.root, handle))].sort();
   assert.deepEqual(await names(), ["file"]);
   await writeFile(path.join(share, "new"), "");
   assert.deepEqual(await names(), ["file", "new"]);

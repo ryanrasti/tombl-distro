@@ -2,6 +2,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { type FS, type FSAttributes, FSError } from "../src/virtio/fs.ts";
 import { body, FuseHarness } from "./fs-fixture.ts";
 
@@ -138,7 +140,7 @@ test("virtio-fs reports a backend's inode numbers and asks it attributes once a 
         return node === file ? { mode: 0o100644, size: 3n, ino: 77n } : { ...directory, ino: 5n };
       },
       opendir: () => "dir",
-      readdir: () => [{ name: "f", node: file, attributes: { mode: 0o100644, size: 3n, ino: 77n } }],
+      readdir: () => ["f"],
       forget: (node) => {
         forgotten = node;
       },
@@ -272,7 +274,7 @@ test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what
         return { node, attributes: { mode: 0o100644, size: 0n, ino: name === "a" ? 10n : 11n } };
       },
       opendir: () => "dir",
-      readdir: () => names.map((name) => ({ name, node: nodes[name as keyof typeof nodes] })),
+      readdir: () => names,
       forget: (node) => void forgotten.push(node),
     }),
   );
@@ -291,12 +293,12 @@ test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what
       ["b", false, 11n],
     ],
   );
-  // "gone", never returned, was dropped at once; each entry returned was a
-  // lookup, kept till the guest forgets it.
-  assert.deepEqual(forgotten, [nodes.gone]);
+  // "gone" was never a node; each entry returned was a lookup, kept till
+  // the guest forgets it.
+  assert.deepEqual(forgotten, []);
   const a = entries[2]![1];
   await harness.request(Opcode.FORGET, a, body(["u64", 1n]));
-  assert.deepEqual(forgotten, [nodes.gone, nodes.a]);
+  assert.deepEqual(forgotten, [nodes.a]);
 
   // An error after an entry: the reply keeps what it has. First, a fresh listing.
   names = ["a", "bad", "b"];
@@ -339,6 +341,30 @@ test("virtio-fs holds a FORGET that comes while a request is in progress till it
   assert.deepEqual(forgotten, []);
   await harness.forget(nodeid, 1n);
   assert.deepEqual(forgotten, [file]);
+  await harness.close();
+});
+
+test("virtio-fs keeps one listing a directory, whatever its handles", async () => {
+  setFlagsFromString("--expose-gc");
+  const gc = runInNewContext("gc") as () => void;
+  // (each listing its own names, as a backend reading the host's would give)
+  const harness = new FuseHarness(
+    filesystem({
+      entry: () => ({ node: {}, attributes: { mode: 0o100644, size: 0n } }),
+      opendir: () => "dir",
+      readdir: () => Array.from({ length: 2000 }, (_, i) => `${"n".repeat(100)}-${i}`),
+    }),
+  );
+  gc();
+  const before = process.memoryUsage().heapUsed;
+  for (let i = 0; i < 200; i++) {
+    const opened = await harness.request(Opcode.OPENDIR, ROOT, open_in());
+    const fh = view(opened.payload).getBigUint64(0, true);
+    assert.equal((await harness.request(Opcode.READDIR, ROOT, read_in(fh, 0n, 4096))).error, 0);
+  }
+  gc();
+  // A listing is about 250 KB: one held, not 200 (50 MB).
+  assert(process.memoryUsage().heapUsed - before < 10_000_000);
   await harness.close();
 });
 

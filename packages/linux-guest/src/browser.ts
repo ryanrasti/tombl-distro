@@ -4,7 +4,6 @@ import {
   type FS,
   type FSAttributes,
   type FSCreateContext,
-  type FSDirectoryEntry,
   FSError,
   type FSSetAttributes,
   type FSTimestamp,
@@ -403,16 +402,11 @@ export class BrowserFS implements FS<Node, Handle> {
     return new Handle(this.#as_node(node));
   }
 
-  async readdir(node: Node, handle: Handle): Promise<FSDirectoryEntry<Node>[]> {
-    const current = this.#open_handle(node, handle);
-    const result: FSDirectoryEntry<Node>[] = [];
-    for await (const [name, handle] of this.#directory(node).entries()) {
-      result.push({
-        name,
-        node: this.#remember([...current.parts, name], handle),
-      });
-    }
-    return result;
+  async readdir(node: Node, handle: Handle): Promise<string[]> {
+    this.#open_handle(node, handle);
+    const names: string[] = [];
+    for await (const name of this.#directory(node).keys()) names.push(name);
+    return names;
   }
 
   async mkdir(parent: Node, name: string, context: FSCreateContext) {
