@@ -181,6 +181,22 @@ const FALLOC_FL_KEEP_SIZE = 1;
 
 const key_of = (stats: BigIntStats) => `${stats.dev}:${stats.ino}`;
 
+/** A host call's error for a path that isn't there: its name, or a directory on the way. */
+function missing(error: unknown) {
+  const { code } = error as { code?: unknown };
+  return code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP";
+}
+
+/** A path's lstat, or undefined if nothing is there. */
+async function lstat_of(at: string) {
+  try {
+    return await lstat(at, { bigint: true });
+  } catch (error) {
+    if (missing(error)) return undefined;
+    throw error;
+  }
+}
+
 /**
  * A host file, by device and inode, with the paths it's known by: more than
  * one for a file's hard links.
@@ -375,7 +391,12 @@ export class NodeFS implements FS<Node, Handle> {
     const directory = path.dirname(at);
     const prefix = this.rootPath === path.sep ? path.sep : `${this.rootPath}${path.sep}`;
     if (directory !== this.rootPath && !directory.startsWith(prefix)) return false;
-    return (await realpath(directory).catch(() => "")) === directory;
+    try {
+      return (await realpath(directory)) === directory;
+    } catch (error) {
+      if (missing(error)) return false;
+      throw error;
+    }
   }
 
   /** A path that holds the node's file now (forgetting those that don't), and its stats; else ESTALE. */
@@ -384,7 +405,7 @@ export class NodeFS implements FS<Node, Handle> {
       throw new FSError("EINVAL", "node belongs to another filesystem");
     }
     for (const at of [...node.paths]) {
-      const stats = await lstat(at, { bigint: true }).catch(() => null);
+      const stats = await lstat_of(at);
       if (stats && key_of(stats) === node.key && (await this.#inside(at))) return [at, stats];
       this.#drop_path(node, at);
     }
@@ -634,18 +655,9 @@ export class NodeFS implements FS<Node, Handle> {
       if (source === destination) return;
       // Not atomic, as renameat2's is (Node has no RENAME_NOREPLACE): only
       // another writer of the share, a host process, can slip between.
-      if (flags & RENAME_NOREPLACE) {
-        const exists = await lstat(destination).then(
-          () => true,
-          () => false,
-        );
-        if (exists) throw new FSError("EEXIST");
-      }
+      const [from, to] = await Promise.all([lstat_of(source), lstat_of(destination)]);
+      if (flags & RENAME_NOREPLACE && to) throw new FSError("EEXIST");
       // Two names of one file: rename does nothing, and both stay.
-      const [from, to] = await Promise.all([
-        lstat(source, { bigint: true }).catch(() => null),
-        lstat(destination, { bigint: true }).catch(() => null),
-      ]);
       const same = from && to && key_of(from) === key_of(to);
       await rename(source, destination);
       if (same) return;
@@ -880,7 +892,7 @@ export class NodeFS implements FS<Node, Handle> {
     this.#children.clear();
     this.root.paths.clear();
     // Known again by its path if it's still there; else every later use is ESTALE.
-    const stats = await lstat(this.rootPath, { bigint: true }).catch(() => null);
+    const stats = await lstat_of(this.rootPath);
     if (stats) this.#adopt_root(stats);
   }
 }
