@@ -61,7 +61,7 @@ import {
 import path from "node:path";
 
 function host_error(error: unknown): never {
-  throw FSError.from(error);
+  throw FSError.from(error) ?? error;
 }
 
 async function node_call<T>(operation: Promise<T>): Promise<T> {
@@ -478,7 +478,7 @@ export class NodeFS implements FS<Node, Handle> {
           try {
             return await this.#entry(this.#below(at, name));
           } catch (error) {
-            if (FSError.from(error).errno === ENOENT) return undefined;
+            if (FSError.from(error)?.errno === ENOENT) return undefined;
             throw error;
           }
         }),

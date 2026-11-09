@@ -86,20 +86,16 @@ test("virtio-fs gives the guest a backend error's Linux errno", async () => {
 
   thrown = new FSError("ESTALE");
   assert.equal((await getattr()).error, -116);
-  // A host error by its code, whatever the host's number for it.
-  thrown = Object.assign(new Error("stale"), { code: "EXDEV", errno: -9999 });
+  // A host call's error by its code's name, whatever the host's number for it.
+  thrown = Object.assign(new Error("stale"), { code: "EXDEV", errno: -9999, syscall: "rename" });
   assert.equal((await getattr()).error, -18);
-  // A malformed request.
-  thrown = new RangeError("out of bounds");
-  assert.equal((await getattr()).error, -22);
-  // Anything else.
-  thrown = new Error("unexpected");
-  assert.equal((await getattr()).error, -5);
-  if (process.platform === "linux") {
-    // On a Linux host, a code Linux doesn't name still has the guest's number.
-    thrown = Object.assign(new Error("odd"), { code: "EWHATEVER", errno: -72 });
-    assert.equal((await getattr()).error, -72);
-  }
+  // A malformed request: its body cut short.
+  assert.equal((await harness.request(Opcode.GETATTR, ROOT, body(["u32", 0]))).error, -22);
+  // A node that isn't there, nodeid 0 too.
+  assert.equal((await harness.request(Opcode.GETATTR, 0n, body(["u32", 0], ["u32", 0], ["u64", 0n]))).error, -2);
+  // Anything else isn't the guest's: it fails the machine.
+  thrown = new TypeError("unexpected");
+  await assert.rejects(getattr(), /unexpected/);
   await harness.close();
 });
 
@@ -399,9 +395,12 @@ test("virtio-fs ends each session at its DESTROY: a mount again starts afresh", 
 });
 
 test("FSError.from gives a backend the errno the device would give the guest", () => {
-  assert.equal(FSError.from(Object.assign(new Error("x"), { code: "EMFILE" })).errno, 24);
-  assert.equal(FSError.from(new FSError("EBUSY")).errno, 16);
-  assert.equal(FSError.from("odd").errno, 5);
+  const system = (code: string) => Object.assign(new Error("x"), { code, syscall: "open" });
+  assert.equal(FSError.from(system("EMFILE"))?.errno, 24);
+  assert.equal(FSError.from(system("EUNHEARD"))?.errno, 5, "a host call's failure Linux has no name for");
+  assert.equal(FSError.from(new FSError("EBUSY"))?.errno, 16);
+  assert.equal(FSError.from(new TypeError("a bug")), undefined, "no filesystem's failure");
+  assert.equal(FSError.from(Object.assign(new Error("x"), { code: "EMFILE" })), undefined, "not a host call's");
   assert.equal(new FSError(72).errno, 72);
 });
 

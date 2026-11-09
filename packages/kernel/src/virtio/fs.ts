@@ -5,7 +5,17 @@
 // `include/uapi/linux/fuse.h` from the kernel this ships with. Fields are
 // little-endian and every fixed-layout struct is padded to a 64-bit boundary.
 
-import { Bytes, FixedArray, Reader, Struct, U16LE, U32LE, U64LE, I32LE } from "@lowland/bytes";
+import {
+  Bytes,
+  FixedArray,
+  Reader,
+  Struct,
+  type Type,
+  U16LE,
+  U32LE,
+  U64LE,
+  I32LE,
+} from "@lowland/bytes";
 import { type Device, public_handle, VirtioDevice } from "./device.ts";
 import type { Virtqueue, VirtqueueBuffer } from "./queue.ts";
 
@@ -164,20 +174,15 @@ export type FSErrorCode = keyof typeof Errno;
 
 /**
  * The errno to give the guest for an error a backend threw: an FSError's own;
- * a host error's by its code (Node's `code`) when Linux has that name; else,
- * on a Linux host, its number (Node's negative `errno`), the same as the
- * guest's; else EIO. A RangeError is a malformed request's, EINVAL.
+ * a host call's (Node's system error: its `code` and `syscall`) by its
+ * code's name, EIO for a name Linux hasn't. Anything else is no
+ * filesystem's failure (a bug, say): undefined, for its caller to throw on.
  */
-function errno_of(error: unknown): number {
+function errno_of(error: unknown): number | undefined {
   if (error instanceof FSError) return error.errno;
-  if (error instanceof RangeError) return Errno.EINVAL;
-  const { code, errno } = (error ?? {}) as { code?: unknown; errno?: unknown };
-  if (typeof code === "string" && Object.hasOwn(Errno, code)) {
-    return Errno[code as FSErrorCode];
-  }
-  const linux = (globalThis as { process?: { platform?: string } }).process?.platform === "linux";
-  if (linux && typeof errno === "number" && errno < 0 && errno > -4096) return -errno;
-  return Errno.EIO;
+  const { code, syscall } = (error ?? {}) as { code?: unknown; syscall?: unknown };
+  if (typeof code !== "string" || typeof syscall !== "string") return undefined;
+  return Object.hasOwn(Errno, code) ? Errno[code as FSErrorCode] : Errno.EIO;
 }
 
 /** An expected filesystem failure which should be returned to the guest. */
@@ -191,10 +196,33 @@ export class FSError extends Error {
     this.errno = typeof code === "number" ? code : Errno[code];
   }
 
-  /** The FSError the device would give the guest for `error` (see errno_of). */
-  static from(error: unknown): FSError {
+  /** The FSError the device would give the guest for `error` (see errno_of), if it's a filesystem's failure. */
+  static from(error: unknown): FSError | undefined {
     if (error instanceof FSError) return error;
-    return new FSError(errno_of(error), error instanceof Error ? error.message : String(error));
+    const errno = errno_of(error);
+    return errno === undefined ? undefined : new FSError(errno, (error as Error).message);
+  }
+}
+
+/** A request's body: a malformed one (read past its end, say) is EINVAL. */
+class RequestReader extends Reader {
+  override bytes(length: number) {
+    return malformed(() => super.bytes(length));
+  }
+  override struct<T>(type: Type<T>): T {
+    return malformed(() => super.struct(type));
+  }
+  override cstring() {
+    return malformed(() => super.cstring());
+  }
+}
+
+function malformed<T>(read: () => T): T {
+  try {
+    return read();
+  } catch (error) {
+    if (error instanceof RangeError) throw new FSError("EINVAL", error.message);
+    throw error;
   }
 }
 
@@ -744,7 +772,7 @@ function scatter(buffers: readonly VirtqueueBuffer[], ...parts: Uint8Array[]) {
     let offset = 0;
     while (offset < data.byteLength) {
       const buffer = writable[index];
-      if (!buffer) throw new Error("guest response buffers are too small");
+      if (!buffer) throw new FSError("EIO", "response exceeds the guest's response buffer");
       const length = Math.min(buffer.array.byteLength - at, data.byteLength - offset);
       buffer.array.set(data.subarray(offset, offset + length), at);
       offset += length;
@@ -1105,7 +1133,14 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     // (grown as written: allocating the guest's whole response capacity, a
     // zeroed array per request, was most of a small request's cost)
     const payload = new Bytes();
-    const node = header.nodeid === 0n ? undefined : node_record(header.nodeid);
+    // (these name no node: their nodeid is 0)
+    const unnamed: number[] = [
+      FuseOpcode.INIT,
+      FuseOpcode.BATCH_FORGET,
+      FuseOpcode.INTERRUPT,
+      FuseOpcode.DESTROY,
+    ];
+    const node = unnamed.includes(header.opcode) ? undefined : node_record(header.nodeid);
 
     switch (header.opcode) {
       case FuseOpcode.INIT: {
@@ -1486,7 +1521,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
             // with what it has (whose lookups count), failing only an empty
             // one, as virtiofsd's.
             if (index - first >= found.length) {
-              if (payload.length > 0) break;
+              if (payload.length > 0 && errno_of(failure) !== undefined) break;
               throw failure;
             }
             const entry = found[index - first];
@@ -1555,9 +1590,6 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
       default:
         throw new UnsupportedOperation();
     }
-    if (payload.length > capacity - FuseOutHeader.size) {
-      throw new FSError("EIO", "response exceeds the guest's response buffer");
-    }
     return payload.array;
   }
 
@@ -1586,7 +1618,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           }
           saw_writable ||= buffer.writable;
         }
-        const body = new Reader(request);
+        const body = new RequestReader(request);
         const header = body.struct(FuseInHeader);
         unique = header.unique;
         if (header.len !== request.byteLength || header.len < FuseInHeader.size) {
@@ -1621,14 +1653,15 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         scatter(buffers, response.array, payload);
         chain.release(FuseOutHeader.size + payload.byteLength);
       } catch (error) {
+        // What the guest can cause, its errno; anything else is the host's
+        // to report (it fails the machine).
+        const errno = errno_of(error);
+        if (errno === undefined) throw error;
         if (capacity < FuseOutHeader.size) {
           chain.release(0);
           continue;
         }
         const response = new Bytes(FuseOutHeader.size);
-        // Malformed requests are EINVAL (RangeError comes from the Reader
-        // bounds checks); a host error keeps its errno (errno_of).
-        const errno = errno_of(error);
         response.alloc(FuseOutHeader).value = {
           len: FuseOutHeader.size,
           error: -errno,
