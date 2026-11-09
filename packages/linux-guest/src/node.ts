@@ -356,10 +356,17 @@ export class NodeFS implements FS<Node, Handle> {
     return result;
   }
 
-  /** A name is gone: from whichever nodes had it, and what was below it. */
+  /**
+   * A name is gone: from whichever nodes had it, and what was below it. A
+   * node left with no name is no longer its device and inode's: the host may
+   * give the inode number to a new file, which must be a new node.
+   */
   #unname(at: string) {
     for (const [p, nodes] of this.#subtree(at)) {
-      for (const node of nodes) this.#drop_path(node, p);
+      for (const node of nodes) {
+        this.#drop_path(node, p);
+        if (!node.paths.size && this.#by_key.get(node.key) === node) this.#by_key.delete(node.key);
+      }
     }
   }
 

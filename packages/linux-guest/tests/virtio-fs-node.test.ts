@@ -152,6 +152,25 @@ test("node virtio-fs adapter keeps open files distinct across unlink and recreat
   await filesystem.release!(replacement.node, replacement.handle);
 });
 
+test("node virtio-fs adapter gives a new node to a new file on a removed one's inode number", async () => {
+  // (no descriptor holds the removed ones, so the host may reuse their
+  // inode numbers at once, as ext4 does)
+  const { share } = await fresh();
+  const filesystem = new NodeFS(share);
+  const owner = { uid: process.getuid!(), gid: process.getgid!() };
+  const directory = await filesystem.mkdir!(filesystem.root, "d", { mode: 0o755, ...owner });
+  await filesystem.rmdir!(filesystem.root, "d");
+  const next = await filesystem.mkdir!(filesystem.root, "e", { mode: 0o755, ...owner });
+  assert.notEqual(next, directory);
+
+  const old = await filesystem.create!(filesystem.root, "f", linux_open.writeonly, { mode: 0o644, ...owner });
+  await filesystem.release!(old.node, old.handle);
+  await filesystem.unlink!(filesystem.root, "f");
+  const replacement = await filesystem.create!(filesystem.root, "g", linux_open.writeonly, { mode: 0o644, ...owner });
+  await filesystem.release!(replacement.node, replacement.handle);
+  assert.notEqual(replacement.node, old.node);
+});
+
 test("node virtio-fs adapter preserves inode generations across replacement rename", async () => {
   const filesystem = new NodeFS(shared);
   const source = await filesystem.create!(filesystem.root, "rename-source", linux_open.readwrite, {
