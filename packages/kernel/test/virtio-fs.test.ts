@@ -312,6 +312,36 @@ test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what
   await harness.close();
 });
 
+test("virtio-fs holds a FORGET that comes while a request is in progress till it's answered", async () => {
+  const file = { name: "f" };
+  let gate: PromiseWithResolvers<void> | undefined;
+  const forgotten: object[] = [];
+  const harness = new FuseHarness(
+    filesystem({
+      entry: async (_parent, name) => {
+        await gate?.promise;
+        return name === "f" ? { node: file, attributes: { mode: 0o100644, size: 0n } } : undefined;
+      },
+      forget: (node) => void forgotten.push(node),
+    }),
+  );
+  const first = await harness.request(Opcode.LOOKUP, ROOT, body(["str", "f"]));
+  const nodeid = view(first.payload).getBigUint64(0, true);
+
+  // The guest looks the name up again while it forgets its first lookup.
+  gate = Promise.withResolvers();
+  const again = harness.request(Opcode.LOOKUP, ROOT, body(["str", "f"]));
+  await harness.forget(nodeid, 1n);
+  assert.deepEqual(forgotten, [], "not while the lookup is in progress");
+  gate.resolve();
+  gate = undefined;
+  assert.equal(view((await again).payload).getBigUint64(0, true), nodeid, "the same node, still known");
+  assert.deepEqual(forgotten, []);
+  await harness.forget(nodeid, 1n);
+  assert.deepEqual(forgotten, [file]);
+  await harness.close();
+});
+
 test("FSError.from gives a backend the errno the device would give the guest", () => {
   assert.equal(FSError.from(Object.assign(new Error("x"), { code: "EMFILE" })).errno, 24);
   assert.equal(FSError.from(new FSError("EBUSY")).errno, 16);

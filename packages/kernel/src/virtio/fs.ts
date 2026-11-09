@@ -955,7 +955,17 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     }
   }
 
+  // Forgets that come (on the high-priority queue) while a request is in
+  // progress wait till it's answered: it may be handing out the node they
+  // would let go of, which the backend may then drop.
+  let requests = 0;
+  const deferred: { record: NodeRecord<TNode>; count: bigint }[] = [];
+
   function forget(record: NodeRecord<TNode>, count: bigint) {
+    if (requests > 0) {
+      deferred.push({ record, count });
+      return;
+    }
     record.lookups = count >= record.lookups ? 0n : record.lookups - count;
     collect_record(record);
   }
@@ -1520,7 +1530,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
    * queue's kicks one at a time (`VirtioDevice.kick`), and each request here
    * is answered before the next is read. So the filesystem sees one request
    * of a queue at a time. The high-priority queue carries only FORGETs,
-   * which reach the filesystem as `forget`, synchronously. Each request's
+   * which reach the filesystem as `forget`, synchronously, or once a
+   * request in progress is answered (`forget`, above). Each request's
    * work is the host's (`host_work`) until its reply is written.
    */
   async function notify(queue: Virtqueue, host_work: <R>(work: Promise<R>) => Promise<R>) {
@@ -1548,7 +1559,17 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         if (capacity < minimum_response_capacity(header.opcode)) {
           throw new FSError("EINVAL", "FUSE response buffer is too small");
         }
-        const payload = await host_work(process(header, body, capacity));
+        const forgets =
+          header.opcode === FuseOpcode.FORGET || header.opcode === FuseOpcode.BATCH_FORGET;
+        if (!forgets) requests += 1;
+        let payload: Uint8Array | undefined;
+        try {
+          payload = await host_work(process(header, body, capacity));
+        } finally {
+          if (!forgets && --requests === 0) {
+            for (const { record, count } of deferred.splice(0)) forget(record, count);
+          }
+        }
         if (payload === undefined) {
           chain.release(0);
           continue;

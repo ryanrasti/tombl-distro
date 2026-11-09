@@ -5,6 +5,10 @@ import { attach_devices, close_device } from "./virtio-fixture.ts";
 
 const RING = 0;
 const RING_SIZE = 64;
+// (the high-priority queue's: 16 descriptors, and a FORGET's buffer)
+const HIPRIO = 1024;
+const HIPRIO_SIZE = 16;
+const FORGET = 2048;
 const REQUEST = 4096;
 const REQUEST_SIZE = 256 * 1024;
 const RESPONSE = REQUEST + REQUEST_SIZE;
@@ -35,6 +39,9 @@ export class FuseHarness {
   #wrap = true;
   #unique = 0n;
   #done: PromiseWithResolvers<void> | undefined;
+  #forgotten: PromiseWithResolvers<void> | undefined;
+  #hiprio_index = 0;
+  #hiprio_wrap = true;
 
   constructor(
     filesystem: FS<object, unknown>,
@@ -45,11 +52,34 @@ export class FuseHarness {
     this.#imports = attach_devices({
       memory: this.memory,
       devices: [this.#device],
-      trigger_irq: () => this.#done?.resolve(),
+      trigger_irq: (irq) => (irq === 0 ? this.#forgotten : this.#done)?.resolve(),
       on_error: (error) => this.#done?.reject(error),
       host_work,
     });
+    this.#imports.enable_vring(0, 0, HIPRIO_SIZE, HIPRIO, 0);
     this.#imports.enable_vring(0, 1, RING_SIZE, RING, 1);
+  }
+
+  /** Sends a FORGET on the high-priority queue, as the guest's driver does, settled once the device has taken it. */
+  async forget(nodeid: bigint, nlookup: bigint) {
+    const request = new DataView(this.memory.buffer, FORGET, 48);
+    request.setUint32(0, 48, true);
+    request.setUint32(4, 2, true);
+    request.setBigUint64(8, ++this.#unique, true);
+    request.setBigUint64(16, nodeid, true);
+    request.setBigUint64(40, nlookup, true);
+    const descriptor = new DataView(this.memory.buffer, HIPRIO + 16 * this.#hiprio_index, 16);
+    descriptor.setBigUint64(0, BigInt(FORGET), true);
+    descriptor.setUint32(8, 48, true);
+    descriptor.setUint16(12, this.#hiprio_index, true);
+    descriptor.setUint16(14, this.#hiprio_wrap ? AVAIL : USED, true);
+    if (++this.#hiprio_index >= HIPRIO_SIZE) {
+      this.#hiprio_index = 0;
+      this.#hiprio_wrap = !this.#hiprio_wrap;
+    }
+    this.#forgotten = Promise.withResolvers();
+    this.#imports.notify(0, 0);
+    await this.#forgotten.promise;
   }
 
   /** Sends one request: its header's fields, then `body`. */
