@@ -475,10 +475,13 @@ class VirtioVsock extends VirtioDevice {
   }
 
   #allocate_port() {
+    // (a port a connection still holds isn't free: a REQUEST on its pair
+    // would be the guest's established connection's)
+    const used = new Set(Array.from(this.#connections.values(), (state) => state.controller.local_port));
     for (let attempts = 0; attempts < 65536 - 49152; attempts++) {
       const port = this.#next_port;
       this.#next_port = port === 65535 ? 49152 : port + 1;
-      if (!this.#listeners.has(port)) return port;
+      if (!this.#listeners.has(port) && !used.has(port)) return port;
     }
     throw new Error("no local vsock ports available");
   }

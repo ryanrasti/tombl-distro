@@ -573,6 +573,21 @@ test("virtio-vsock rejects an opened connection reset before the guest answers",
   await close_device(device);
 });
 
+test("virtio-vsock gives an opened connection a host port no connection holds, past the ports' wrap", async () => {
+  const device = vsockDevice();
+  const guest = vsock_guest(device);
+  const held = device.open(5000);
+  guest.send(2, 5000, held.local_port);
+  await held.opened;
+  // (every other host port used once and let go of)
+  const others = Array.from({ length: 65536 - 49152 - 1 }, () => device.open(5000, { timeoutMs: 1 }));
+  await Promise.all(others.map((connection) => connection.closed));
+  const next = device.open(5000, { timeoutMs: 1 });
+  next.opened.catch(() => {});
+  assert.notEqual(next.local_port, held.local_port);
+  await close_device(device);
+});
+
 test("virtio reset invalidates stale chains and pending notifications", async () => {
   const reset_memory = new WebAssembly.Memory({
     initial: 1,
