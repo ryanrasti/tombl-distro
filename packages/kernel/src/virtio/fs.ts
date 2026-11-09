@@ -78,7 +78,10 @@ const FUSE_MAJOR = 7;
 const FUSE_MINOR = 45;
 const FUSE_MINIMUM_MINOR = 27;
 
-/** A request's most pages: 1 MiB at 4 KiB pages. */
+/**
+ * The most pages a request is offered. Linux's driver takes at most its
+ * queue's size less 4 (252 of this device's 256): about 1 MiB at 4 KiB pages.
+ */
 const MAX_PAGES = 256;
 
 /** fuse_open_out's open_flags: keep the file's page cache across opens. */
@@ -407,8 +410,9 @@ export interface FSDeviceOptions {
    */
   cache?: boolean;
   /**
-   * The guest's page size, in bytes (default 4096). A request carries at
-   * most 256 pages, so reads and writes of 1 MiB at 4 KiB pages.
+   * The guest's page size, in bytes (default 4096), which sizes requests:
+   * at most 252 pages each (`MAX_PAGES`), reads and writes of about 1 MiB at
+   * 4 KiB pages.
    */
   pageSize?: number;
 }

@@ -446,6 +446,13 @@ function vsock_guest(device: ReturnType<typeof vsockDevice>) {
         payload = new Uint8Array(),
         // (a payload of this many bytes, whatever memory follows the header)
         length = payload.byteLength,
+      }: {
+        flags?: number;
+        fwd_cnt?: number;
+        type?: number;
+        buf_alloc?: number;
+        payload?: Uint8Array;
+        length?: number;
       } = {},
     ) {
       // (the ring of 8 taken round: a slot each, its flags the lap's)
@@ -602,7 +609,9 @@ test("virtio-vsock gives an opened connection a host port no connection holds, p
   guest.send(2, 5000, held.local_port);
   await held.opened;
   // (every other host port used once and let go of)
-  const others = Array.from({ length: 65536 - 49152 - 1 }, () => device.open(5000, { timeoutMs: 1 }));
+  const others = Array.from({ length: 65536 - 49152 - 1 }, () =>
+    device.open(5000, { timeoutMs: 1 }),
+  );
   await Promise.all(others.map((connection) => connection.closed));
   const next = device.open(5000, { timeoutMs: 1 });
   next.opened.catch(() => {});
@@ -633,6 +642,35 @@ test("virtio-vsock reads the guest's packets no further while its replies fill t
   assert.equal(accepted, 0, "not read while 64 replies wait");
   guest.post_rx();
   assert.equal(accepted, 4, "read once the guest takes some");
+  await close_device(device);
+});
+
+test("virtio-vsock resets a guest past the credit it was given", async () => {
+  const device = vsockDevice();
+  const connections: { read(): Promise<Uint8Array> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  guest.send(1, 5000, 1234);
+  // (256 KiB is the host's buffer: 7 packets of 40,000 bytes are more)
+  for (let i = 0; i < 7; i++) guest.send(5, 5000, 1234, { length: 40_000 });
+  await assert.rejects(connections[0]!.read(), /reset/);
+  assert.deepEqual(guest.received(), [2, 3]);
+  await close_device(device);
+});
+
+test("virtio-vsock reads a SEQPACKET connection a message at a time, its packets joined", async () => {
+  const device = vsockDevice();
+  const connections: { read(): Promise<Uint8Array> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  const text = (value: string) => new TextEncoder().encode(value);
+  guest.send(1, 5000, 1234, { type: 2 });
+  guest.send(5, 5000, 1234, { type: 2, payload: text("ab") });
+  guest.send(5, 5000, 1234, { type: 2, payload: text("cd"), flags: 1 });
+  guest.send(5, 5000, 1234, { type: 2, payload: text("e"), flags: 1 });
+  const decoder = new TextDecoder();
+  assert.equal(decoder.decode(await connections[0]!.read()), "abcd");
+  assert.equal(decoder.decode(await connections[0]!.read()), "e");
   await close_device(device);
 });
 

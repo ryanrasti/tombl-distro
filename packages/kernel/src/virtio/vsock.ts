@@ -245,7 +245,9 @@ function create_vsock_connection(
     // A message the peer can't hold whole would wait forever for credit it
     // gives only as it reads whole messages: EMSGSIZE, as Linux's.
     if (seqpacket && data.byteLength > peer_buf_alloc) {
-      throw Object.assign(new Error("vsock message larger than the peer's buffer"), { code: "EMSGSIZE" });
+      throw Object.assign(new Error("vsock message larger than the peer's buffer"), {
+        code: "EMSGSIZE",
+      });
     }
     let offset = 0;
     do {
@@ -371,7 +373,6 @@ interface VsockConnectionState {
   reject(error: Error): void;
 }
 
-/** A host listener's connections, as the guest makes them. */
 /**
  * A host listener's connections, as the guest makes them: accepted at once,
  * or (a promise) once it resolves, and reset if it rejects.
@@ -489,7 +490,9 @@ class VirtioVsock extends VirtioDevice {
   #allocate_port() {
     // (a port a connection still holds isn't free: a REQUEST on its pair
     // would be the guest's established connection's)
-    const used = new Set(Array.from(this.#connections.values(), (state) => state.controller.local_port));
+    const used = new Set(
+      Array.from(this.#connections.values(), (state) => state.controller.local_port),
+    );
     for (let attempts = 0; attempts < 65536 - 49152; attempts++) {
       const port = this.#next_port;
       this.#next_port = port === 65535 ? 49152 : port + 1;
@@ -501,8 +504,8 @@ class VirtioVsock extends VirtioDevice {
   /**
    * Pending packets into the guest's receive buffers, written in place: a
    * payload larger than a buffer split across buffers, a packet each. A
-   * malformed buffer fails the device: this runs for the host's callers
-   * too, which it mustn't throw to.
+   * malformed buffer is reported as the device's failure (which fails the
+   * machine), not thrown: this runs for the host's callers too.
    */
   #flush() {
     try {
