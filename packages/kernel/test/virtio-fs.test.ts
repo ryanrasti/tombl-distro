@@ -13,6 +13,7 @@ const Opcode = {
   GETATTR: 3,
   OPEN: 14,
   INIT: 26,
+  DESTROY: 38,
   OPENDIR: 27,
   READDIR: 28,
   MKNOD: 8,
@@ -366,6 +367,35 @@ test("virtio-fs keeps one listing a directory, whatever its handles", async () =
   // A listing is about 250 KB: one held, not 200 (50 MB).
   assert(process.memoryUsage().heapUsed - before < 10_000_000);
   await harness.close();
+});
+
+test("virtio-fs ends each session at its DESTROY: a mount again starts afresh", async () => {
+  const file = { name: "f" };
+  let destroyed = 0;
+  const harness = new FuseHarness(
+    filesystem({
+      entry: (_parent, name) =>
+        name === "f" ? { node: file, attributes: { mode: 0o100644, size: 0n } } : undefined,
+      destroy: () => void (destroyed += 1),
+    }),
+  );
+  const nodeid = async () => {
+    const reply = await harness.request(Opcode.LOOKUP, ROOT, body(["str", "f"]));
+    return view(reply.payload).getBigUint64(0, true);
+  };
+  await harness.request(Opcode.INIT, 0n, init(7, 45));
+  const first = await nodeid();
+  await harness.request(Opcode.DESTROY, 0n);
+  assert.equal(destroyed, 1);
+  // (the guest sends no FORGETs as it unmounts: the session's nodes go with it)
+  assert.equal((await harness.request(Opcode.GETATTR, first, getattr_in())).error, -2);
+
+  await harness.request(Opcode.INIT, 0n, init(7, 45));
+  assert.notEqual(await nodeid(), first);
+  await harness.request(Opcode.DESTROY, 0n);
+  assert.equal(destroyed, 2, "the second session's DESTROY too");
+  await harness.close();
+  assert.equal(destroyed, 2, "nothing left to end at close");
 });
 
 test("FSError.from gives a backend the errno the device would give the guest", () => {

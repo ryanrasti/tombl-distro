@@ -930,7 +930,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
 
   const handles = new Map<bigint, HandleRecord<TNode, THandle>>();
   let next_handle = 1n;
-  let finalize_promise: Promise<void> | undefined;
+  /** The guest's DESTROY ended its session, and no INIT has begun another. */
+  let destroyed = false;
 
   function record_for_node(node: TNode, parent: NodeRecord<TNode>) {
     let record = by_node.get(node);
@@ -1010,38 +1011,46 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     collect_record(handle.node);
   }
 
-  function finalize() {
-    if (finalize_promise) return finalize_promise;
-    finalize_promise = (async () => {
-      let failed = false;
-      let first_error: unknown;
-      for (const [fh, handle] of handles) {
-        try {
-          if (handle.directory) {
-            await filesystem.releasedir?.(handle.node.node, handle.handle);
-          } else {
-            await filesystem.release?.(handle.node.node, handle.handle);
-          }
-        } catch (error) {
-          if (!failed) {
-            failed = true;
-            first_error = error;
-          }
-        } finally {
-          remove_handle(fh, handle);
-        }
-      }
+  /**
+   * A session's end (the guest's DESTROY, or the device's close): every
+   * handle released, every node but the root let go of (the guest sends no
+   * FORGETs as it unmounts), and the filesystem's destroy.
+   */
+  async function finalize() {
+    let failed = false;
+    let first_error: unknown;
+    for (const [fh, handle] of handles) {
       try {
-        await filesystem.destroy?.();
+        if (handle.directory) {
+          await filesystem.releasedir?.(handle.node.node, handle.handle);
+        } else {
+          await filesystem.release?.(handle.node.node, handle.handle);
+        }
       } catch (error) {
         if (!failed) {
           failed = true;
           first_error = error;
         }
+      } finally {
+        remove_handle(fh, handle);
       }
-      if (failed) throw first_error;
-    })();
-    return finalize_promise;
+    }
+    for (const record of records.values()) {
+      if (record === root) continue;
+      records.delete(record.id);
+      by_node.delete(record.node);
+    }
+    root.lookups = 1n;
+    root.children = 0;
+    try {
+      await filesystem.destroy?.();
+    } catch (error) {
+      if (!failed) {
+        failed = true;
+        first_error = error;
+      }
+    }
+    if (failed) throw first_error;
   }
 
   /** A name's record, one more lookup of it, and its attributes. */
@@ -1110,6 +1119,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         }
         // Older minors lack replies this device's structs assume.
         if (init.minor < FUSE_MINIMUM_MINOR) throw new FSError("EPROTO");
+        destroyed = false;
         const supported_flags =
           FuseInitFlags.ASYNC_READ |
           FuseInitFlags.ATOMIC_O_TRUNC |
@@ -1539,6 +1549,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
       case FuseOpcode.INTERRUPT:
         return undefined;
       case FuseOpcode.DESTROY:
+        destroyed = true;
         await finalize();
         break;
       default:
@@ -1629,7 +1640,11 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     }
   }
 
-  return public_handle(new FileSystemDevice(config, notify, finalize), {});
+  // (closed after a DESTROY: that session is already ended)
+  const close = async () => {
+    if (!destroyed) await finalize();
+  };
+  return public_handle(new FileSystemDevice(config, notify, close), {});
 }
 
 class FileSystemDevice extends VirtioDevice {
