@@ -39,6 +39,18 @@ await mkdir(shared);
 await mkdir(outside);
 after(() => rm(temporary, { recursive: true, force: true }));
 
+// Nix's build sandbox refuses set-id bits: its seccomp filter fails a chmod
+// with S_ISUID or S_ISGID with EPERM.
+const set_id_probe = path.join(temporary, "set-id-probe");
+await writeFile(set_id_probe, "");
+const set_id_refused = await chmod(set_id_probe, 0o2755).then(
+  () => false,
+  (error: NodeJS.ErrnoException) => {
+    if (error.code !== "EPERM") throw error;
+    return "set-id bits refused here (EPERM), as in Nix's build sandbox";
+  },
+);
+
 test("node virtio-fs adapter reads and writes beneath its root", async () => {
   const filesystem = new NodeFS(shared);
   const created = await filesystem.create!(
@@ -409,18 +421,22 @@ test("node virtio-fs adapter makes files with the guest's mode, not the host pro
   assert.equal((await stat(path.join(share, "f"))).mode & 0o7777, 0o666);
 });
 
-test("node virtio-fs adapter keeps a setgid parent's setgid on mkdir, as Linux's", async () => {
-  const { share } = await fresh();
-  await mkdir(path.join(share, "p"));
-  await chmod(path.join(share, "p"), 0o2775);
-  const filesystem = new NodeFS(share);
-  await filesystem.mkdir!(
-    await node_at(filesystem, "p"),
-    "child",
-    context(constants.S_IFDIR | 0o755),
-  );
-  assert.equal((await stat(path.join(share, "p", "child"))).mode & 0o7777, 0o2755);
-});
+test(
+  "node virtio-fs adapter keeps a setgid parent's setgid on mkdir, as Linux's",
+  { skip: set_id_refused },
+  async () => {
+    const { share } = await fresh();
+    await mkdir(path.join(share, "p"));
+    await chmod(path.join(share, "p"), 0o2775);
+    const filesystem = new NodeFS(share);
+    await filesystem.mkdir!(
+      await node_at(filesystem, "p"),
+      "child",
+      context(constants.S_IFDIR | 0o755),
+    );
+    assert.equal((await stat(path.join(share, "p", "child"))).mode & 0o7777, 0o2755);
+  },
+);
 
 test("node virtio-fs adapter lists a directory once per readdir, not at opendir", async () => {
   const { share } = await fresh();
@@ -532,15 +548,19 @@ test("node virtio-fs adapter serves a share at / below its first level", async (
   assert.equal(await read_all(filesystem, file), "inside\n");
 });
 
-test("node virtio-fs adapter masks setuid and setgid from the guest unless allowed", async () => {
-  const { share } = await fresh();
-  const filesystem = new NodeFS(share);
-  await filesystem.setattr!(await node_at(filesystem, "file"), { mode: 0o6755 });
-  assert.equal((await stat(path.join(share, "file"))).mode & 0o7777, 0o755);
-  const allowed = new NodeFS(share, { setuid: true });
-  await allowed.setattr!(await node_at(allowed, "file"), { mode: 0o2755 });
-  assert.equal((await stat(path.join(share, "file"))).mode & 0o7777, 0o2755);
-});
+test(
+  "node virtio-fs adapter masks setuid and setgid from the guest unless allowed",
+  { skip: set_id_refused },
+  async () => {
+    const { share } = await fresh();
+    const filesystem = new NodeFS(share);
+    await filesystem.setattr!(await node_at(filesystem, "file"), { mode: 0o6755 });
+    assert.equal((await stat(path.join(share, "file"))).mode & 0o7777, 0o755);
+    const allowed = new NodeFS(share, { setuid: true });
+    await allowed.setattr!(await node_at(allowed, "file"), { mode: 0o2755 });
+    assert.equal((await stat(path.join(share, "file"))).mode & 0o7777, 0o2755);
+  },
+);
 
 test("node virtio-fs adapter's rename of a name onto another of the same file keeps both", async () => {
   const { share } = await fresh();
