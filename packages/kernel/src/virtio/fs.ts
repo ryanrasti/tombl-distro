@@ -177,15 +177,17 @@ export type FSErrorCode = keyof typeof Errno;
 
 /**
  * The errno to give the guest for an error a backend threw: an FSError's own;
- * a host call's (Node's system error: its `code` and `syscall`) by its
- * code's name, EIO for a name Linux hasn't. Anything else is no
- * filesystem's failure (a bug, say): undefined, for its caller to throw on.
+ * an error's by its `code` when Linux has that name; a host call's (Node's
+ * system error, with its `syscall`) whose name Linux hasn't, EIO. Anything
+ * else is no filesystem's failure (a bug, say): undefined, for its caller
+ * to throw on.
  */
 function errno_of(error: unknown): number | undefined {
   if (error instanceof FSError) return error.errno;
   const { code, syscall } = (error ?? {}) as { code?: unknown; syscall?: unknown };
-  if (typeof code !== "string" || typeof syscall !== "string") return undefined;
-  return Object.hasOwn(Errno, code) ? Errno[code as FSErrorCode] : Errno.EIO;
+  if (typeof code !== "string") return undefined;
+  if (Object.hasOwn(Errno, code)) return Errno[code as FSErrorCode];
+  return typeof syscall === "string" ? Errno.EIO : undefined;
 }
 
 /** An expected filesystem failure which should be returned to the guest. */

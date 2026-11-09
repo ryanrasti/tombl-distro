@@ -443,11 +443,9 @@ test("FSError.from gives a backend the errno the device would give the guest", (
   );
   assert.equal(FSError.from(new FSError("EBUSY"))?.errno, 16);
   assert.equal(FSError.from(new TypeError("a bug")), undefined, "no filesystem's failure");
-  assert.equal(
-    FSError.from(Object.assign(new Error("x"), { code: "EMFILE" })),
-    undefined,
-    "not a host call's",
-  );
+  const coded = (code: string) => Object.assign(new Error("x"), { code });
+  assert.equal(FSError.from(coded("EIO"))?.errno, 5, "a backend's own error, by its code's name");
+  assert.equal(FSError.from(coded("ERR_INVALID_ARG_TYPE")), undefined, "Node's, a bug's");
   assert.equal(new FSError(72).errno, 72);
 });
 
