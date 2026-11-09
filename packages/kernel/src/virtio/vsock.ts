@@ -84,8 +84,9 @@ export interface VsockConnection {
   /** Reads `length` bytes, or fewer if the peer finishes first. */
   readExactly(length: number): Promise<Uint8Array>;
   /**
-   * Writes data (one message, on a SEQPACKET connection), waiting for credit
-   * when the peer's buffer is full. The connection takes the bytes: they're
+   * Writes data (one message, on a SEQPACKET connection, rejected with
+   * EMSGSIZE if larger than the peer's buffer), waiting for credit when the
+   * peer's buffer is full. The connection takes the bytes: they're
    * read until they reach the guest, so they aren't changed after.
    */
   write(data: Uint8Array): Promise<void>;
@@ -241,6 +242,11 @@ function create_vsock_connection(
 
   async function write_serialized(data: Uint8Array) {
     if (!seqpacket && data.byteLength === 0) return;
+    // A message the peer can't hold whole would wait forever for credit it
+    // gives only as it reads whole messages: EMSGSIZE, as Linux's.
+    if (seqpacket && data.byteLength > peer_buf_alloc) {
+      throw Object.assign(new Error("vsock message larger than the peer's buffer"), { code: "EMSGSIZE" });
+    }
     let offset = 0;
     do {
       if (write_done) throw new Error("vsock connection is closed");

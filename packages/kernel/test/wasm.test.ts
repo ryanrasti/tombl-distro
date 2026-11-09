@@ -434,21 +434,36 @@ function vsock_guest(device: ReturnType<typeof vsockDevice>) {
   let sent = 0;
   return {
     /** a packet from the guest's port to the host's (CID 2): its flags, and how much the guest has read (fwd_cnt) */
-    send(op: number, src_port: number, dst_port: number, { flags = 0, fwd_cnt = 0 } = {}) {
+    send(
+      op: number,
+      src_port: number,
+      dst_port: number,
+      {
+        flags = 0,
+        fwd_cnt = 0,
+        type = 1,
+        buf_alloc = 65536,
+        payload = new Uint8Array(),
+        // (a payload of this many bytes, whatever memory follows the header)
+        length = payload.byteLength,
+      } = {},
+    ) {
       const at = 4096 + sent * 64;
       new Uint8Array(memory.buffer, at, 44).fill(0);
+      new Uint8Array(memory.buffer, at + 44, payload.byteLength).set(payload);
+      view.setUint32(at + 24, length, true);
       view.setBigUint64(at, 3n, true);
       view.setBigUint64(at + 8, 2n, true);
       view.setUint32(at + 16, src_port, true);
       view.setUint32(at + 20, dst_port, true);
-      view.setUint16(at + 28, 1, true);
+      view.setUint16(at + 28, type, true);
       view.setUint16(at + 30, op, true);
       view.setUint32(at + 32, flags, true);
-      view.setUint32(at + 36, 65536, true);
+      view.setUint32(at + 36, buf_alloc, true);
       view.setUint32(at + 40, fwd_cnt, true);
       const d = 512 + sent * 16;
       view.setBigUint64(d, BigInt(at), true);
-      view.setUint32(d + 8, 44, true);
+      view.setUint32(d + 8, 44 + length, true);
       view.setUint16(d + 12, sent, true);
       view.setUint16(d + 14, AVAIL, true);
       sent++;
@@ -585,6 +600,18 @@ test("virtio-vsock gives an opened connection a host port no connection holds, p
   const next = device.open(5000, { timeoutMs: 1 });
   next.opened.catch(() => {});
   assert.notEqual(next.local_port, held.local_port);
+  await close_device(device);
+});
+
+test("virtio-vsock refuses a SEQPACKET message larger than the guest's buffer: EMSGSIZE", async () => {
+  const device = vsockDevice();
+  const connections: { write(d: Uint8Array): Promise<void> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  guest.send(1, 5000, 1234, { type: 2, buf_alloc: 1000 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await assert.rejects(connections[0]!.write(new Uint8Array(1001)), { code: "EMSGSIZE" });
+  await connections[0]!.write(new Uint8Array(1000));
   await close_device(device);
 });
 
