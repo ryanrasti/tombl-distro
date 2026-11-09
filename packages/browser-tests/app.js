@@ -9,6 +9,11 @@ import {
 import { guestAgent } from "@lowland/guest";
 import { BrowserFS } from "@lowland/guest/browser";
 
+/** A name's node in a directory node, as the device looks one up. */
+async function lookup(filesystem, parent, name) {
+  return (await filesystem.entries(parent, [name]))[0]?.node;
+}
+
 async function collectProcess(child) {
   const [status, stdout, stderr] = await Promise.all([
     child.status,
@@ -342,11 +347,11 @@ globalThis.opfsVirtioFileSystem = async () => {
   ).sort();
 
   const reopened = new BrowserFS(directory);
-  const node = await reopened.lookup(reopened.root, "renamed");
+  const node = await lookup(reopened, reopened.root, "renamed");
   const handle = await reopened.open(node, 0);
   const persisted = await reopened.read(node, handle, 0n, input.length);
-  const movedDirectory = await reopened.lookup(reopened.root, "moved-directory");
-  const nestedNode = await reopened.lookup(movedDirectory, "nested");
+  const movedDirectory = await lookup(reopened, reopened.root, "moved-directory");
+  const nestedNode = await lookup(reopened, movedDirectory, "nested");
   const nestedHandle = await reopened.open(nestedNode, 0);
   const nestedPersisted = await reopened.read(nestedNode, nestedHandle, 0n, 5);
   await filesystem.setattr(created.node, {
@@ -396,7 +401,7 @@ globalThis.opfsVirtioFileSystem = async () => {
     { mode: 0o100600, uid: 1000, gid: 1000 },
   );
   await directory.removeEntry("external-identity");
-  const missing = await filesystem.lookup(filesystem.root, "external-identity");
+  const missing = await lookup(filesystem, filesystem.root, "external-identity");
   const externalFile = await directory.getFileHandle("external-identity", { create: true });
   const externalWritable = await externalFile.createWritable();
   await externalWritable.write("new");
@@ -404,7 +409,7 @@ globalThis.opfsVirtioFileSystem = async () => {
   await filesystem
     .write(externalOld.node, externalOld.handle, 0n, new TextEncoder().encode("OLD"))
     .catch(() => {});
-  const externalReplacement = await filesystem.lookup(filesystem.root, "external-identity");
+  const externalReplacement = await lookup(filesystem, filesystem.root, "external-identity");
   const externalReplacementHandle = await filesystem.open(externalReplacement, 0);
   const externalReplacementData = await filesystem.read(
     externalReplacement,
@@ -439,11 +444,11 @@ globalThis.opfsVirtioFileSystem = async () => {
     new TextEncoder().encode("destination"),
   );
   await filesystem.rename(filesystem.root, "rename-source", filesystem.root, "rename-destination");
-  const renamed = await filesystem.lookup(filesystem.root, "rename-destination");
+  const renamed = await lookup(filesystem, filesystem.root, "rename-destination");
   const renamedHandle = await filesystem.open(renamed, 0);
   const renameDestinationData = await filesystem.read(renamed, renamedHandle, 0n, 6);
   const renameSourceMissing =
-    (await filesystem.lookup(filesystem.root, "rename-source")) === undefined;
+    (await lookup(filesystem, filesystem.root, "rename-source")) === undefined;
   const replacedHandleStale = await filesystem.getattr(renameDestination.node).then(
     () => false,
     () => true,
@@ -503,7 +508,7 @@ globalThis.opfsVirtioFileSystemGuest = async () => {
   );
 
   const reopened = new BrowserFS(directory);
-  const node = await reopened.lookup(reopened.root, "persistent");
+  const node = await lookup(reopened, reopened.root, "persistent");
   const handle = await reopened.open(node, 0);
   const persisted = await reopened.read(node, handle, 0n, input.byteLength);
   return {

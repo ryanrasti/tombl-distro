@@ -64,7 +64,7 @@ test("node virtio-fs adapter rejects adversarial path components", async () => {
   const filesystem = new NodeFS(shared);
   for (const name of ["", ".", "..", "../outside", "/absolute", "nul\0byte"]) {
     await assert.rejects(
-      async () => filesystem.lookup(filesystem.root, name),
+      async () => lookup(filesystem, filesystem.root, name),
       (error) => error instanceof FSError && [13, 22].includes(error.errno),
       name,
     );
@@ -75,7 +75,7 @@ test("node virtio-fs adapter exposes a final symlink without following it", asyn
   await writeFile(path.join(outside, "secret"), "outside");
   await symlink(path.join(outside, "secret"), path.join(shared, "escape"));
   const filesystem = new NodeFS(shared);
-  const escaped = await filesystem.lookup(filesystem.root, "escape");
+  const escaped = await lookup(filesystem, filesystem.root, "escape");
   assert(escaped);
   assert.equal((await filesystem.getattr(escaped)).mode & constants.S_IFMT, constants.S_IFLNK);
   assert.equal(await filesystem.readlink!(escaped), path.join(outside, "secret"));
@@ -88,7 +88,7 @@ test("node virtio-fs adapter never follows a final symlink for metadata operatio
   await symlink(target, link);
   const before = await stat(target);
   const filesystem = new NodeFS(shared);
-  const escaped = await filesystem.lookup(filesystem.root, "metadata-escape");
+  const escaped = await lookup(filesystem, filesystem.root, "metadata-escape");
   assert(escaped);
 
   await assert.rejects(
@@ -200,7 +200,7 @@ test("node virtio-fs adapter preserves inode generations across replacement rena
 
   await filesystem.rename!(filesystem.root, "rename-source", filesystem.root, "rename-destination");
 
-  assert.equal(await filesystem.lookup(filesystem.root, "rename-destination"), source.node);
+  assert.equal(await lookup(filesystem, filesystem.root, "rename-destination"), source.node);
   assert.equal((await filesystem.getattr(source.node)).size, 6n);
   await assert.rejects(
     filesystem.getattr(destination.node),
@@ -212,7 +212,7 @@ test("node virtio-fs adapter enforces read-only shares in the backend", async ()
   const name = "read-only-source";
   await writeFile(path.join(shared, name), "readable");
   const filesystem = new NodeFS(shared, { readOnly: true });
-  const node = await filesystem.lookup(filesystem.root, name);
+  const node = await lookup(filesystem, filesystem.root, name);
   assert(node);
   const handle = await filesystem.open!(node, linux_open.readonly | linux_open.closeOnExec);
   assert.equal(new TextDecoder().decode(await filesystem.read!(node, handle, 0n, 8)), "readable");
@@ -244,7 +244,7 @@ test("node virtio-fs adapter enforces read-only shares in the backend", async ()
 
 test("node virtio-fs adapter rejects Linux open modes it cannot implement", async () => {
   const filesystem = new NodeFS(shared);
-  const node = await filesystem.lookup(filesystem.root, "hello");
+  const node = await lookup(filesystem, filesystem.root, "hello");
   assert(node);
   await assert.rejects(
     filesystem.open!(node, linux_open.readonly | linux_open.path),
@@ -265,14 +265,14 @@ test("node virtio-fs adapter creates symbolic links", async () => {
 test("node virtio-fs adapter detects an ancestor replaced by a symlink", async () => {
   await mkdir(path.join(shared, "safe"));
   const filesystem = new NodeFS(shared);
-  const safe = await filesystem.lookup(filesystem.root, "safe");
+  const safe = await lookup(filesystem, filesystem.root, "safe");
   assert(safe);
 
   await rename(path.join(shared, "safe"), path.join(shared, "moved"));
   await symlink(outside, path.join(shared, "safe"));
   // The node was the directory; the name now holds a symlink, another file: stale.
   await assert.rejects(
-    async () => filesystem.lookup(safe, "secret"),
+    async () => lookup(filesystem, safe, "secret"),
     (error) => error instanceof FSError && error.errno === 116,
   );
 });
@@ -294,6 +294,11 @@ const context = (mode: number) => ({ mode, uid: process.getuid!(), gid: process.
 const errno = (code: number) => (error: unknown) =>
   error instanceof FSError && error.errno === code;
 
+/** A name's node in a directory node, as the device looks one up. */
+async function lookup(filesystem: NodeFS, parent: object, name: string) {
+  return (await filesystem.entries(parent as never, [name]))[0]?.node;
+}
+
 async function read_all(filesystem: NodeFS, node: object) {
   const handle = await filesystem.open!(node as never, linux_open.readonly);
   const data = await filesystem.read!(node as never, handle, 0n, 100);
@@ -304,7 +309,7 @@ async function read_all(filesystem: NodeFS, node: object) {
 async function node_at(filesystem: NodeFS, ...names: string[]) {
   let node = filesystem.root;
   for (const name of names) {
-    const found = await filesystem.lookup(node, name);
+    const found = await lookup(filesystem, node, name);
     assert(found, name);
     node = found;
   }
@@ -343,7 +348,7 @@ test("node virtio-fs adapter keeps a file by any of its names", async () => {
   // The host renamed it: no name known to hold it, until it's looked up again.
   await rename(path.join(share, "other"), path.join(share, "moved"));
   await assert.rejects(filesystem.getattr(file), errno(116));
-  assert.equal(await filesystem.lookup(filesystem.root, "moved"), file);
+  assert.equal(await lookup(filesystem, filesystem.root, "moved"), file);
   assert.equal(await read_all(filesystem, file), "inside\n");
 });
 
@@ -356,7 +361,7 @@ test("node virtio-fs adapter follows its own renames of a directory and what's b
   const f = await node_at(filesystem, "a", "b", "f");
   await filesystem.rename!(filesystem.root, "a", filesystem.root, "z", 0);
   assert.equal(await read_all(filesystem, f), "deep\n");
-  assert.equal(await filesystem.lookup(b, "f"), f);
+  assert.equal(await lookup(filesystem, b, "f"), f);
 });
 
 test("node virtio-fs adapter shows the owner given, and ignores changes of owner", async () => {
@@ -378,10 +383,10 @@ test("node virtio-fs adapter lists names, and gives a lookup's attributes with i
   const names = [...(await filesystem.readdir!(filesystem.root, handle))];
   await filesystem.releasedir!(filesystem.root, handle);
   assert.deepEqual(names.sort(), ["d", "file"]);
-  const entry = await filesystem.entry!(filesystem.root, "file");
+  const [entry] = await filesystem.entries(filesystem.root, ["file"]);
   assert.equal(entry?.attributes.ino, (await stat(path.join(share, "file"), { bigint: true })).ino);
   assert.equal(entry!.attributes.mode & constants.S_IFMT, constants.S_IFREG);
-  assert.equal((await filesystem.entry!(filesystem.root, "file"))?.node, entry!.node);
+  assert.equal((await filesystem.entries(filesystem.root, ["file"]))[0]?.node, entry!.node);
 });
 
 test("node virtio-fs adapter makes files with the guest's mode, not the host process's umask", async () => {
@@ -591,5 +596,5 @@ test("node virtio-fs adapter closes everything at destroy even once the share is
   await filesystem.destroy!();
   await assert.rejects(filesystem.read!(file, handle, 0n, 1), errno(9));
   await assert.rejects(filesystem.readdir!(filesystem.root, listing), errno(116));
-  await assert.rejects(filesystem.lookup(filesystem.root, "file"), errno(116));
+  await assert.rejects(lookup(filesystem, filesystem.root, "file"), errno(116));
 });

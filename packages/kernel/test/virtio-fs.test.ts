@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
-import { type FS, type FSAttributes, FSError } from "../src/virtio/fs.ts";
+import { type FS, type FSAttributes, type FSEntry, FSError } from "../src/virtio/fs.ts";
 import { body, FuseHarness } from "./fs-fixture.ts";
 
 const Opcode = {
@@ -78,8 +78,19 @@ const directory: FSAttributes = { mode: 0o040755, size: 0n };
 /** A filesystem of one directory, the root, whose operations a test supplies. */
 function filesystem(methods: Partial<FS<object, unknown>> = {}): FS<object, unknown> {
   const root = {};
-  return { root, lookup: () => undefined, getattr: () => directory, ...methods };
+  return {
+    root,
+    entries: (_parent, names) => names.map(() => undefined),
+    getattr: () => directory,
+    ...methods,
+  };
 }
+
+/** A backend's entries, each name's from `entry`. */
+const each_name =
+  (entry: (name: string) => FSEntry<object> | undefined | Promise<FSEntry<object> | undefined>) =>
+  (_parent: object, names: readonly string[]) =>
+    Promise.all(names.map(async (name) => entry(name)));
 
 test("virtio-fs gives the guest a backend error's Linux errno", async () => {
   let thrown: unknown;
@@ -142,10 +153,11 @@ test("virtio-fs reports a backend's inode numbers and asks it attributes once a 
   let forgotten: object | undefined;
   const harness = new FuseHarness(
     filesystem({
-      entry: (_parent, name) =>
+      entries: each_name((name) =>
         name === "f"
           ? { node: file, attributes: { mode: 0o100644, size: 3n, ino: 77n } }
           : undefined,
+      ),
       getattr: (node) => {
         getattrs += 1;
         return node === file ? { mode: 0o100644, size: 3n, ino: 77n } : { ...directory, ino: 5n };
@@ -190,7 +202,7 @@ test("virtio-fs takes a backend's cache validity and keep-cache", async () => {
   const harness = new FuseHarness(
     {
       ...filesystem({
-        lookup: () => file,
+        entries: each_name(() => ({ node: file, attributes: { mode: 0o100444, size: 1n } })),
         getattr: (node) => (node === file ? { mode: 0o100444, size: 1n } : directory),
         open: () => "handle",
       }),
@@ -213,7 +225,11 @@ test("virtio-fs serves hard links, mknod, rename flags, fallocate, syncfs and fs
   const calls: unknown[][] = [];
   const harness = new FuseHarness(
     filesystem({
-      lookup: (_parent, name) => (name === "f" ? file : undefined),
+      entries: each_name((name) =>
+        name === "f"
+          ? { node: file, attributes: { mode: 0o100644, size: 0n, nlink: 2 } }
+          : undefined,
+      ),
       getattr: (node) => (node === file ? { mode: 0o100644, size: 0n, nlink: 2 } : directory),
       link: (node, _parent, name) => (calls.push(["link", node, name]), node),
       mknod: (_parent, name, rdev, context) => (
@@ -296,12 +312,12 @@ test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what
   const harness = new FuseHarness(
     filesystem({
       getattr: () => ({ ...directory, ino: 5n }),
-      entry: (_parent, name) => {
+      entries: each_name((name) => {
         if (name === "gone") return undefined;
         if (name === "bad") throw new FSError("EACCES");
         const node = nodes[name as keyof typeof nodes];
         return { node, attributes: { mode: 0o100644, size: 0n, ino: name === "a" ? 10n : 11n } };
-      },
+      }),
       opendir: () => "dir",
       readdir: () => names,
       forget: (node) => void forgotten.push(node),
@@ -332,13 +348,14 @@ test("virtio-fs READDIRPLUS gives each entry, counts it a lookup, and keeps what
   await harness.request(Opcode.FORGET, a, body(["u64", 1n]));
   assert.deepEqual(forgotten, [nodes.a]);
 
-  // An error after an entry: the reply keeps what it has. First, a fresh listing.
+  // An error looking the names up: the reply keeps what it has, "." and "..".
+  // First, a fresh listing.
   names = ["a", "bad", "b"];
   const partial = await harness.request(Opcode.READDIRPLUS, ROOT, read_in(dir, 0n, 4096));
   assert.equal(partial.error, 0);
   assert.deepEqual(
     direntsplus(partial.payload).map(([name]) => name),
-    [".", "..", "a"],
+    [".", ".."],
   );
   // The same error with nothing yet written fails the request.
   const failed = await harness.request(Opcode.READDIRPLUS, ROOT, read_in(dir, 3n, 4096));
@@ -352,10 +369,10 @@ test("virtio-fs holds a FORGET that comes while a request is in progress till it
   const forgotten: object[] = [];
   const harness = new FuseHarness(
     filesystem({
-      entry: async (_parent, name) => {
+      entries: each_name(async (name) => {
         await gate?.promise;
         return name === "f" ? { node: file, attributes: { mode: 0o100644, size: 0n } } : undefined;
-      },
+      }),
       forget: (node) => void forgotten.push(node),
     }),
   );
@@ -386,7 +403,7 @@ test("virtio-fs keeps one listing a directory, whatever its handles", async () =
   // (each listing its own names, as a backend reading the host's would give)
   const harness = new FuseHarness(
     filesystem({
-      entry: () => ({ node: {}, attributes: { mode: 0o100644, size: 0n } }),
+      entries: each_name(() => ({ node: {}, attributes: { mode: 0o100644, size: 0n } })),
       opendir: () => "dir",
       readdir: () => Array.from({ length: 2000 }, (_, i) => `${"n".repeat(100)}-${i}`),
     }),
@@ -409,8 +426,9 @@ test("virtio-fs ends each session at its DESTROY: a mount again starts afresh", 
   let destroyed = 0;
   const harness = new FuseHarness(
     filesystem({
-      entry: (_parent, name) =>
+      entries: each_name((name) =>
         name === "f" ? { node: file, attributes: { mode: 0o100644, size: 0n } } : undefined,
+      ),
       destroy: () => void (destroyed += 1),
     }),
   );

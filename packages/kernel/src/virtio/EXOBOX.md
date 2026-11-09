@@ -22,8 +22,8 @@ devices, and to go back to tombl/distro eventually.
   `READDIRPLUS`.
 - **Inodes:**
   - A backend gives its inode numbers (`ino`), lookups with attributes
-    (`entry`, and `entries` for several names at once), `timeout`,
-    `keepCache` and `forget`.
+    (`entries`, one name or a listing's at once), `timeout`, `keepCache`
+    and `forget`.
   - A FORGET that comes on the high-priority queue while a request is in
     progress waits until that request is answered.
   - DESTROY ends a session: its handles are released, every node but the

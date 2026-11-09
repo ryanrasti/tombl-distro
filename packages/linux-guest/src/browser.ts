@@ -238,7 +238,16 @@ export class BrowserFS implements FS<Node, Handle> {
     }
   }
 
-  async lookup(parent: Node, name: string) {
+  async entries(parent: Node, names: readonly string[]) {
+    return await Promise.all(
+      names.map(async (name) => {
+        const node = await this.#lookup(parent, name);
+        return node && { node, attributes: await this.getattr(node) };
+      }),
+    );
+  }
+
+  async #lookup(parent: Node, name: string) {
     const parent_node = this.#as_node(parent);
     const parts = [...parent_node.parts, valid_name(name)];
     const handle = await this.#child(this.#directory(parent), name);
@@ -427,7 +436,7 @@ export class BrowserFS implements FS<Node, Handle> {
 
   async unlink(parent: Node, name: string) {
     name = valid_name(name);
-    const child = await this.lookup(parent, name);
+    const child = await this.#lookup(parent, name);
     if (!child) throw new FSError("ENOENT");
     if (this.#as_node(child).handle.kind !== "file") {
       throw new FSError("EISDIR");
@@ -438,7 +447,7 @@ export class BrowserFS implements FS<Node, Handle> {
 
   async rmdir(parent: Node, name: string) {
     name = valid_name(name);
-    const child = await this.lookup(parent, name);
+    const child = await this.#lookup(parent, name);
     if (!child) throw new FSError("ENOENT");
     if (this.#as_node(child).handle.kind !== "directory") {
       throw new FSError("ENOTDIR");
@@ -474,7 +483,7 @@ export class BrowserFS implements FS<Node, Handle> {
     const old_parent = this.#as_node(oldParent);
     const new_parent = this.#as_node(newParent);
     if (old_parent === new_parent && oldName === newName) return;
-    const source = await this.lookup(old_parent, oldName);
+    const source = await this.#lookup(old_parent, oldName);
     if (!source) throw new FSError("ENOENT");
     const source_node = this.#as_node(source);
     const old_parts = [...old_parent.parts, oldName];
@@ -486,7 +495,7 @@ export class BrowserFS implements FS<Node, Handle> {
       throw new FSError("EINVAL", "cannot move a directory into itself");
     }
 
-    const existing = await this.lookup(new_parent, newName);
+    const existing = await this.#lookup(new_parent, newName);
     if (existing) {
       const existing_node = this.#as_node(existing);
       if (source_node.handle.kind === "directory" && existing_node.handle.kind !== "directory") {

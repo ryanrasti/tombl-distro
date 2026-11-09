@@ -485,14 +485,6 @@ export class NodeFS implements FS<Node, Handle> {
     return handle;
   }
 
-  async lookup(parent: Node, name: string) {
-    return (await this.entry(parent, name))?.node;
-  }
-
-  async entry(parent: Node, name: string) {
-    return (await this.entries(parent, [name]))[0];
-  }
-
   /** Names in a directory node: each one's entry, undefined if it isn't there; the directory checked once. */
   async entries(parent: Node, names: readonly string[]) {
     return await this.#path_operation(async () => {

@@ -313,20 +313,14 @@ export interface FS<TNode, THandle> {
   readonly timeout?: number;
   /** Keep the guest's page cache of a file across opens (FOPEN_KEEP_CACHE): for files that don't change. */
   readonly keepCache?: boolean;
-  lookup(parent: TNode, name: string): MaybePromise<TNode | undefined>;
   /**
-   * A name's node with its attributes, if the backend gets both at once: the
-   * device then uses it for lookups instead of lookup and a getattr.
+   * Names' nodes with their attributes, undefined for a name that isn't
+   * there (or went while listed): a lookup's one name, or a listing's names
+   * a reply at a time. (Measured, NodeFS over a 5,000-file directory, its
+   * whole READDIRPLUS: 283 ms a name at a time, the directory checked for
+   * each; 88 ms together.)
    */
-  entry?(parent: TNode, name: string): MaybePromise<FSEntry<TNode> | undefined>;
-  /**
-   * Names' entries at once, each as `entry` gives it: a listing's, a reply
-   * at a time. Without it, `entry` (or `lookup` and `getattr`) a name at a
-   * time. (Measured, NodeFS over a 5,000-file directory, its whole
-   * READDIRPLUS: 283 ms a name at a time, the directory checked for each;
-   * 88 ms together.)
-   */
-  entries?(parent: TNode, names: readonly string[]): MaybePromise<(FSEntry<TNode> | undefined)[]>;
+  entries(parent: TNode, names: readonly string[]): MaybePromise<(FSEntry<TNode> | undefined)[]>;
   /**
    * The guest has forgotten a node: no lookup, open handle or child of it is
    * left. A backend may drop what it keeps for the node; a later lookup of
@@ -386,8 +380,8 @@ export interface FS<TNode, THandle> {
   release?(node: TNode, handle: THandle): MaybePromise<void>;
   opendir?(node: TNode, flags: number): MaybePromise<THandle>;
   /**
-   * A directory's names, without "." and "..": the device looks each one up
-   * (`entry`, else `lookup` and `getattr`) as it lists it.
+   * A directory's names, without "." and "..": the device looks them up
+   * (`entries`) as it lists them.
    */
   readdir?(node: TNode, handle: THandle): MaybePromise<Iterable<string> | AsyncIterable<string>>;
   releasedir?(node: TNode, handle: THandle): MaybePromise<void>;
@@ -1087,48 +1081,19 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
   /** A name's record, one more lookup of it, and its attributes. */
   async function lookup(parent: NodeRecord<TNode>, name: string) {
     validate_name(name);
-    let node: TNode | undefined;
-    let attributes: FSAttributes | undefined;
-    if (filesystem.entry) {
-      const found = await filesystem.entry(parent.node, name);
-      node = found?.node;
-      attributes = found?.attributes;
-    } else {
-      node = await filesystem.lookup(parent.node, name);
-    }
-    if (!node) throw new FSError("ENOENT");
-    attributes ??= await filesystem.getattr(node);
-    const record = record_for_node(node, parent);
+    const [found] = await filesystem.entries(parent.node, [name]);
+    if (!found) throw new FSError("ENOENT");
+    const record = record_for_node(found.node, parent);
     record.lookups += 1n;
-    return { record, attributes };
+    return { record, attributes: found.attributes };
   }
 
-  /**
-   * A listing's names' entries, undefined for one gone since: those before
-   * a failure, and the failure.
-   */
+  /** A listing's names' entries, undefined for one gone since; or none, and the failure. */
   async function entries_of(parent: NodeRecord<TNode>, names: readonly string[]) {
-    const found: (FSEntry<TNode> | undefined)[] = [];
     try {
-      if (filesystem.entries) return { found: await filesystem.entries(parent.node, names) };
-      for (const name of names) {
-        let entry: FSEntry<TNode> | undefined;
-        try {
-          if (filesystem.entry) {
-            entry = await filesystem.entry(parent.node, name);
-          } else {
-            const node = await filesystem.lookup(parent.node, name);
-            entry = node && { node, attributes: await filesystem.getattr(node) };
-          }
-        } catch (error) {
-          const errno = errno_of(error);
-          if (errno !== Errno.ENOENT && errno !== Errno.ESTALE) throw error;
-        }
-        found.push(entry);
-      }
-      return { found };
+      return { found: await filesystem.entries(parent.node, names) };
     } catch (failure) {
-      return { found, failure };
+      return { found: [], failure };
     }
   }
 
@@ -1301,7 +1266,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         const new_name = validate_name(body.cstring());
         const known = async (parent: NodeRecord<TNode>, name: string) => {
           if (node === new_parent) return undefined;
-          const found = await filesystem.lookup(parent.node, name);
+          const found = (await filesystem.entries(parent.node, [name]))[0]?.node;
           if (!found) return undefined;
           const record = by_node.get(found);
           // (a node the guest doesn't know: the backend may let it go)

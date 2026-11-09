@@ -58,8 +58,12 @@ class MemoryFileSystem implements FS<MemoryNode, MemoryHandle> {
     return result;
   }
 
-  lookup(parent: MemoryNode, name: string) {
-    return this.#directory(parent).children.get(name);
+  entries(parent: MemoryNode, names: readonly string[]) {
+    const { children } = this.#directory(parent);
+    return names.map((name) => {
+      const node = children.get(name);
+      return node && { node, attributes: this.getattr(node) };
+    });
   }
 
   getattr(node: MemoryNode, handle?: MemoryHandle): FSAttributes {
