@@ -761,8 +761,7 @@ export class NodeFS implements FS<Node, Handle> {
   async read(node: Node, handle: Handle, offset: bigint, length: number) {
     const file = this.#file(handle, node);
     const start = checked_offset(offset);
-    // Not zeroed: only what's read is returned.
-    const buffer = Buffer.allocUnsafe(length);
+    const buffer = Buffer.alloc(length);
     let read = 0;
     while (read < length) {
       const { bytesRead } = await node_call(file.read(buffer, read, length - read, start + read));
