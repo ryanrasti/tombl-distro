@@ -16,12 +16,19 @@
   "type": "module",
   "exports": {
     ".": {
+      "lowland-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
     "./plugin": {
+      "lowland-source": "./src/plugin.ts",
       "types": "./dist/plugin.d.ts",
       "default": "./dist/plugin.js"
+    },
+    "./internal/*": {
+      "lowland-source": "./src/*.ts",
+      "types": "./dist/*.d.ts",
+      "default": "./dist/*.js"
     }
   },
   "scripts": {

@@ -16,14 +16,17 @@
   "type": "module",
   "exports": {
     ".": {
+      "lowland-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
     "./browser": {
+      "lowland-source": "./src/browser.ts",
       "types": "./dist/browser.d.ts",
       "default": "./dist/browser.js"
     },
     "./node": {
+      "lowland-source": "./src/node.ts",
       "types": "./dist/node.d.ts",
       "default": "./dist/node.js"
     }

@@ -407,6 +407,273 @@ test("virtio-vsock drops guest buffers and connections on reset", async () => {
   await close_device(device);
 });
 
+/** A guest for a vsock device: its receive buffers posted, its packets sent by hand. */
+function vsock_guest(device: ReturnType<typeof vsockDevice>) {
+  const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+  const imports = attach_devices({
+    memory,
+    devices: [device],
+    trigger_irq() {},
+    on_error(error) {
+      throw error;
+    },
+  });
+  const view = new DataView(memory.buffer);
+  const AVAIL = 1 << 7;
+  const WRITE = 1 << 1;
+  // (rx: 4 descriptors at 0, their buffers at 1024; tx: 8 at 512, theirs at 4096)
+  for (let i = 0; i < 4; i++) {
+    view.setBigUint64(i * 16, BigInt(1024 + i * 256), true);
+    view.setUint32(i * 16 + 8, 256, true);
+    view.setUint16(i * 16 + 12, i, true);
+    view.setUint16(i * 16 + 14, AVAIL | WRITE, true);
+  }
+  imports.enable_vring(0, 0, 4, 0, 1);
+  imports.enable_vring(0, 1, 8, 512, 2);
+  imports.notify(0, 0);
+  let sent = 0;
+  return {
+    /** a packet from the guest's port to the host's (CID 2): its flags, and how much the guest has read (fwd_cnt) */
+    send(
+      op: number,
+      src_port: number,
+      dst_port: number,
+      {
+        flags = 0,
+        fwd_cnt = 0,
+        type = 1,
+        buf_alloc = 65536,
+        payload = new Uint8Array(),
+        // (a payload of this many bytes, whatever memory follows the header)
+        length = payload.byteLength,
+      }: {
+        flags?: number;
+        fwd_cnt?: number;
+        type?: number;
+        buf_alloc?: number;
+        payload?: Uint8Array;
+        length?: number;
+      } = {},
+    ) {
+      // (the ring of 8 taken round: a slot each, its flags the lap's)
+      const slot = sent % 8;
+      const at = 4096 + slot * 64;
+      new Uint8Array(memory.buffer, at, 44).fill(0);
+      new Uint8Array(memory.buffer, at + 44, payload.byteLength).set(payload);
+      view.setUint32(at + 24, length, true);
+      view.setBigUint64(at, 3n, true);
+      view.setBigUint64(at + 8, 2n, true);
+      view.setUint32(at + 16, src_port, true);
+      view.setUint32(at + 20, dst_port, true);
+      view.setUint16(at + 28, type, true);
+      view.setUint16(at + 30, op, true);
+      view.setUint32(at + 32, flags, true);
+      view.setUint32(at + 36, buf_alloc, true);
+      view.setUint32(at + 40, fwd_cnt, true);
+      const d = 512 + slot * 16;
+      view.setBigUint64(d, BigInt(at), true);
+      view.setUint32(d + 8, 44 + length, true);
+      view.setUint16(d + 12, slot, true);
+      view.setUint16(d + 14, Math.floor(sent / 8) % 2 === 0 ? AVAIL : 1 << 15, true);
+      sent++;
+      imports.notify(0, 1);
+    },
+    /** its 4 receive buffers posted again, for the ring's second lap */
+    post_rx() {
+      for (let i = 0; i < 4; i++) view.setUint16(i * 16 + 14, (1 << 15) | WRITE, true);
+      imports.notify(0, 0);
+    },
+    /** the ops of the packets the device has put in the guest's buffers, in order */
+    received() {
+      const ops: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        if ((view.getUint16(i * 16 + 14, true) & (1 << 15)) === 0) break;
+        ops.push(view.getUint16(1024 + i * 256 + 30, true));
+      }
+      return ops;
+    },
+  };
+}
+
+test("virtio-vsock answers a guest's connection before it sends on it", async () => {
+  const device = vsockDevice();
+  const accepted = Promise.withResolvers<void>();
+  device.listen(1234, (connection) => {
+    // (written before the listener says: held till its RESPONSE)
+    void connection.write(new Uint8Array([7]));
+    return accepted.promise;
+  });
+  const guest = vsock_guest(device);
+  guest.send(1, 5000, 1234);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  accepted.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(guest.received(), [2, 5]);
+  await close_device(device);
+});
+
+test("virtio-vsock says when a connection is gone (closed)", async () => {
+  const device = vsockDevice();
+  const connected = Promise.withResolvers<{ closed: Promise<void> }>();
+  device.listen(1234, (connection) => connected.resolve(connection));
+  const guest = vsock_guest(device);
+  guest.send(1, 5000, 1234);
+  const connection = await connected.promise;
+  let gone = false;
+  void connection.closed.then(() => (gone = true));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(gone, false);
+  guest.send(3, 5000, 1234);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(gone, true);
+  await close_device(device);
+});
+
+test("virtio-vsock takes a guest's connection anew on a port pair it still holds, the old one reset", async () => {
+  const device = vsockDevice();
+  const connections: { closed: Promise<void>; read(): Promise<Uint8Array> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  guest.send(1, 1023, 1234);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  // (the guest's port again, its old connection let go of on its side)
+  guest.send(1, 1023, 1234);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(connections.length, 2);
+  assert.deepEqual(guest.received(), [2, 2]);
+  await connections[0]!.closed;
+  await assert.rejects(connections[0]!.read(), /reset/);
+  await close_device(device);
+});
+
+test("virtio-vsock reads a guest's close with what it sent unread as a reset", async () => {
+  const device = vsockDevice();
+  const connections: { write(d: Uint8Array): Promise<void>; read(): Promise<Uint8Array> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  // (one connection closed with the host's byte unread, one with it read)
+  guest.send(1, 1000, 1234);
+  guest.send(1, 1001, 1234);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await connections[0]!.write(new Uint8Array([7]));
+  await connections[1]!.write(new Uint8Array([7]));
+  guest.send(4, 1000, 1234, { flags: 3, fwd_cnt: 0 });
+  guest.send(4, 1001, 1234, { flags: 3, fwd_cnt: 1 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await assert.rejects(connections[0]!.read(), /reset/);
+  assert.equal((await connections[1]!.read()).byteLength, 0);
+  await close_device(device);
+});
+
+test("virtio-vsock opens a connection to the guest at once, its writes held till the guest's RESPONSE", async () => {
+  const device = vsockDevice();
+  const guest = vsock_guest(device);
+  const connection = device.open(5000);
+  const wrote = connection.write(new Uint8Array([7]));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  // (its REQUEST alone, so far)
+  assert.deepEqual(guest.received(), [1]);
+  guest.send(2, 5000, connection.local_port);
+  await connection.opened;
+  await wrote;
+  assert.deepEqual(guest.received(), [1, 5]);
+  await close_device(device);
+});
+
+test("virtio-vsock refuses an opened connection the guest resets: opened rejects, and its writes", async () => {
+  const device = vsockDevice();
+  const guest = vsock_guest(device);
+  const connection = device.open(5001);
+  const wrote = connection.write(new Uint8Array([7]));
+  wrote.catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  guest.send(3, 5001, connection.local_port);
+  await assert.rejects(connection.opened, /reset/);
+  await assert.rejects(wrote);
+  await close_device(device);
+});
+
+test("virtio-vsock rejects an opened connection reset before the guest answers", async () => {
+  const device = vsockDevice();
+  vsock_guest(device);
+  const connection = device.open(5002);
+  connection.reset();
+  await assert.rejects(connection.opened, /before it was made/);
+  await close_device(device);
+});
+
+test("virtio-vsock gives an opened connection a host port no connection holds, past the ports' wrap", async () => {
+  const device = vsockDevice();
+  const guest = vsock_guest(device);
+  const held = device.open(5000);
+  guest.send(2, 5000, held.local_port);
+  await held.opened;
+  // (every other host port used once and let go of)
+  const others = Array.from({ length: 65536 - 49152 - 1 }, () =>
+    device.open(5000, { timeoutMs: 1 }),
+  );
+  await Promise.all(others.map((connection) => connection.closed));
+  const next = device.open(5000, { timeoutMs: 1 });
+  next.opened.catch(() => {});
+  assert.notEqual(next.local_port, held.local_port);
+  await close_device(device);
+});
+
+test("virtio-vsock refuses a SEQPACKET message larger than the guest's buffer: EMSGSIZE", async () => {
+  const device = vsockDevice();
+  const connections: { write(d: Uint8Array): Promise<void> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  guest.send(1, 5000, 1234, { type: 2, buf_alloc: 1000 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await assert.rejects(connections[0]!.write(new Uint8Array(1001)), { code: "EMSGSIZE" });
+  await connections[0]!.write(new Uint8Array(1000));
+  await close_device(device);
+});
+
+test("virtio-vsock reads the guest's packets no further while its replies fill the receive queue", async () => {
+  const device = vsockDevice();
+  let accepted = 0;
+  device.listen(1234, () => void (accepted += 1));
+  const guest = vsock_guest(device);
+  // (68 to ports no one listens on: 4 RSTs in the guest's buffers, 64 waiting)
+  for (let i = 0; i < 68; i++) guest.send(1, 6000 + i, 4321);
+  for (let i = 0; i < 4; i++) guest.send(1, 7000 + i, 1234);
+  assert.equal(accepted, 0, "not read while 64 replies wait");
+  guest.post_rx();
+  assert.equal(accepted, 4, "read once the guest takes some");
+  await close_device(device);
+});
+
+test("virtio-vsock resets a guest past the credit it was given", async () => {
+  const device = vsockDevice();
+  const connections: { read(): Promise<Uint8Array> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  guest.send(1, 5000, 1234);
+  // (256 KiB is the host's buffer: 7 packets of 40,000 bytes are more)
+  for (let i = 0; i < 7; i++) guest.send(5, 5000, 1234, { length: 40_000 });
+  await assert.rejects(connections[0]!.read(), /reset/);
+  assert.deepEqual(guest.received(), [2, 3]);
+  await close_device(device);
+});
+
+test("virtio-vsock reads a SEQPACKET connection a message at a time, its packets joined", async () => {
+  const device = vsockDevice();
+  const connections: { read(): Promise<Uint8Array> }[] = [];
+  device.listen(1234, (connection) => void connections.push(connection));
+  const guest = vsock_guest(device);
+  const text = (value: string) => new TextEncoder().encode(value);
+  guest.send(1, 5000, 1234, { type: 2 });
+  guest.send(5, 5000, 1234, { type: 2, payload: text("ab") });
+  guest.send(5, 5000, 1234, { type: 2, payload: text("cd"), flags: 1 });
+  guest.send(5, 5000, 1234, { type: 2, payload: text("e"), flags: 1 });
+  const decoder = new TextDecoder();
+  assert.equal(decoder.decode(await connections[0]!.read()), "abcd");
+  assert.equal(decoder.decode(await connections[0]!.read()), "e");
+  await close_device(device);
+});
+
 test("virtio reset invalidates stale chains and pending notifications", async () => {
   const reset_memory = new WebAssembly.Memory({
     initial: 1,

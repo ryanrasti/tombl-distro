@@ -35,6 +35,13 @@ export interface VirtioConnectionContext {
   memory: WebAssembly.Memory;
   trigger_irq(irq: number): void;
   on_error(error: unknown): void;
+  /**
+   * Work the guest waits for that ends by itself, soon (a filesystem's
+   * request, served from the host's files), as the host counts it: its
+   * result as is. A host that turns its event loop more often while such
+   * work is in progress gives it here. Unset, nothing is counted.
+   */
+  host_work?<T>(work: Promise<T>): Promise<T>;
   // Hooks for `serveDevice`, which runs a device in a worker. They replace
   // only publication: queue traversal and the device are unchanged, while the
   // main thread retains the final writes to guest memory. A device attached
@@ -55,6 +62,8 @@ export interface BusDevice {
   readonly features: bigint;
   readonly config: Uint8Array;
   readonly queues: number;
+  /** The most descriptors each of its queues takes (virtio's queue_num_max). */
+  readonly queue_size: number;
   readonly closed: Promise<void>;
   attach(context: VirtioConnectionContext): ConnectedVirtioDevice;
   /** Idempotently stops the device and releases its backend. */
@@ -92,6 +101,12 @@ export interface VirtioDeviceOptions {
   /** The device's configuration space, at most 256 bytes. */
   config?: Uint8Array;
   /**
+   * The most descriptors each queue takes (256 if not given). A guest fills
+   * a receive queue at probe, a buffer a descriptor: a device that receives
+   * little (a console) needs few.
+   */
+  queue_size?: number;
+  /**
    * Present descriptors as views of guest memory instead of copies. A guest
    * reset then waits for the device's kicks and spawned work in flight, so
    * that work must stop touching its views when it settles.
@@ -113,6 +128,7 @@ export abstract class VirtioDevice implements BusDevice {
   /** Mutate in place, then call `update_config()`. Its size is fixed. */
   readonly config: Uint8Array;
   readonly queues: number;
+  readonly queue_size: number;
   readonly closed: Promise<void>;
 
   #closed = Promise.withResolvers<void>();
@@ -122,17 +138,20 @@ export abstract class VirtioDevice implements BusDevice {
   #config_pending = false;
   #views: boolean;
   #on_error: (error: unknown) => void = () => {};
+  #host_work: (<T>(work: Promise<T>) => Promise<T>) | undefined;
 
   constructor({
     id,
     queues,
     features = 0n,
     config = new Uint8Array(),
+    queue_size = 256,
     views = false,
   }: VirtioDeviceOptions) {
     this.id = id;
     this.#views = views;
     this.queues = queues;
+    this.queue_size = queue_size;
     this.features =
       TransportFeatures.VERSION_1 |
       TransportFeatures.RING_PACKED |
@@ -163,6 +182,11 @@ export abstract class VirtioDevice implements BusDevice {
 
   /** Releases the backend, after in-flight kicks have settled. Called once. */
   protected close(): void | PromiseLike<void> {}
+
+  /** `work`, as the host counts work the guest waits for (`VirtioConnectionContext.host_work`). */
+  protected host_work<T>(work: Promise<T>): Promise<T> {
+    return this.#host_work ? this.#host_work(work) : work;
+  }
 
   /** Whether the device has started shutting down. */
   protected get stopped() {
@@ -221,6 +245,11 @@ export abstract class VirtioDevice implements BusDevice {
     return this.closed;
   }
 
+  /**
+   * Runs a kick: undefined once it's done, if it finished before returning
+   * (the next kick may run at once), else its promise. Throws what a
+   * synchronous kick throws.
+   */
   #dispatch(vq: number, queue: Virtqueue): Promise<void> | undefined {
     if (this.#stopped) return;
     assert(vq < this.queues, `virtio device has no queue ${vq}`);
@@ -228,11 +257,18 @@ export abstract class VirtioDevice implements BusDevice {
     // Track the kick before running it, so a kick that reentrantly shuts the
     // device down is still awaited before close().
     this.#active.add(completion.promise);
+    let result: void | PromiseLike<void>;
     try {
-      Promise.resolve(this.kick(vq, queue)).then(completion.resolve, completion.reject);
+      result = this.kick(vq, queue);
     } catch (error) {
-      completion.reject(error);
+      this.#active.delete(completion.promise);
+      throw error;
     }
+    if (!result || typeof result.then !== "function") {
+      this.#active.delete(completion.promise);
+      return;
+    }
+    Promise.resolve(result).then(completion.resolve, completion.reject);
     void completion.promise.finally(() => this.#active.delete(completion.promise)).catch(() => {});
     return completion.promise;
   }
@@ -241,24 +277,40 @@ export abstract class VirtioDevice implements BusDevice {
     assert(!this.#stopped, "cannot attach a closed virtio device");
     assert(!this.#attached, "virtio device is already attached");
     this.#on_error = context.on_error;
+    this.#host_work = context.host_work;
     const queues: QueueState[] = [];
     const queue_state = (vq: number) =>
       (queues[vq] ??= { queue: undefined, pending: false, notifying: false });
 
-    const drain = async (vq: number) => {
+    // A kick done before it returns frees its queue at once: the guest's
+    // next notification is handled as it comes, not after the event loop's
+    // next turn (which a guest that keeps running, or ends, may not give).
+    const drain = (vq: number): void => {
       const state = queue_state(vq);
       if (state.notifying || !state.queue) return;
       state.notifying = true;
       try {
         do {
           state.pending = false;
-          await this.#dispatch(vq, state.queue);
+          const running = this.#dispatch(vq, state.queue);
+          if (running) {
+            running.then(
+              () => {
+                state.notifying = false;
+                if (state.pending) drain(vq);
+              },
+              (error) => {
+                state.notifying = false;
+                context.on_error(error);
+              },
+            );
+            return;
+          }
         } while (state.pending && state.queue);
       } catch (error) {
         context.on_error(error);
-      } finally {
-        state.notifying = false;
       }
+      state.notifying = false;
     };
 
     return {

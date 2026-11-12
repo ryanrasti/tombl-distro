@@ -5,7 +5,17 @@
 // `include/uapi/linux/fuse.h` from the kernel this ships with. Fields are
 // little-endian and every fixed-layout struct is padded to a 64-bit boundary.
 
-import { Bytes, FixedArray, Reader, Struct, U16LE, U32LE, U64LE, I32LE } from "@lowland/bytes";
+import {
+  Bytes,
+  FixedArray,
+  Reader,
+  Struct,
+  type Type,
+  U16LE,
+  U32LE,
+  U64LE,
+  I32LE,
+} from "@lowland/bytes";
 import { type Device, public_handle, VirtioDevice } from "./device.ts";
 import type { Virtqueue, VirtqueueBuffer } from "./queue.ts";
 
@@ -20,16 +30,19 @@ const FuseOpcode = {
   SETATTR: 4,
   READLINK: 5,
   SYMLINK: 6,
+  MKNOD: 8,
   MKDIR: 9,
   UNLINK: 10,
   RMDIR: 11,
   RENAME: 12,
+  LINK: 13,
   OPEN: 14,
   READ: 15,
   WRITE: 16,
   STATFS: 17,
   RELEASE: 18,
   FSYNC: 20,
+  GETXATTR: 22,
   FLUSH: 25,
   INIT: 26,
   OPENDIR: 27,
@@ -41,15 +54,38 @@ const FuseOpcode = {
   INTERRUPT: 36,
   DESTROY: 38,
   BATCH_FORGET: 42,
+  FALLOCATE: 43,
+  READDIRPLUS: 44,
+  RENAME2: 45,
+  SYNCFS: 50,
 } as const;
 
 const FuseInitFlags = {
   ASYNC_READ: 1 << 0,
+  ATOMIC_O_TRUNC: 1 << 3,
   BIG_WRITES: 1 << 5,
   AUTO_INVAL_DATA: 1 << 12,
+  DO_READDIRPLUS: 1 << 13,
+  READDIRPLUS_AUTO: 1 << 14,
+  PARALLEL_DIROPS: 1 << 18,
   MAX_PAGES: 1 << 22,
+  CACHE_SYMLINKS: 1 << 23,
   INIT_EXT: 1 << 30,
 } as const;
+
+/** The protocol version this device speaks, and the oldest minor it takes. */
+const FUSE_MAJOR = 7;
+const FUSE_MINOR = 45;
+const FUSE_MINIMUM_MINOR = 27;
+
+/**
+ * The most pages a request is offered. Linux's driver takes at most its
+ * queue's size less 4 (252 of this device's 256): about 1 MiB at 4 KiB pages.
+ */
+const MAX_PAGES = 256;
+
+/** fuse_open_out's open_flags: keep the file's page cache across opens. */
+const FOPEN_KEEP_CACHE = 1 << 1;
 
 const FuseGetattrFlags = {
   FH: 1 << 0,
@@ -88,36 +124,110 @@ const DirentType = {
   socket: 12,
 } as const;
 
+// Linux's errno values (asm-generic/errno-base.h and errno.h): what the guest
+// is told, whatever the host's own numbers are.
 const Errno = {
   EPERM: 1,
   ENOENT: 2,
+  ESRCH: 3,
+  EINTR: 4,
   EIO: 5,
+  ENXIO: 6,
+  E2BIG: 7,
   EBADF: 9,
+  EAGAIN: 11,
+  ENOMEM: 12,
   EACCES: 13,
+  EFAULT: 14,
+  EBUSY: 16,
   EEXIST: 17,
+  EXDEV: 18,
+  ENODEV: 19,
   ENOTDIR: 20,
   EISDIR: 21,
   EINVAL: 22,
+  ENFILE: 23,
+  EMFILE: 24,
+  ENOTTY: 25,
+  ETXTBSY: 26,
+  EFBIG: 27,
   ENOSPC: 28,
+  ESPIPE: 29,
   EROFS: 30,
-  EPROTO: 71,
+  EMLINK: 31,
+  ERANGE: 34,
+  EDEADLK: 35,
   ENAMETOOLONG: 36,
+  ENOLCK: 37,
   ENOSYS: 38,
   ENOTEMPTY: 39,
   ELOOP: 40,
+  ENODATA: 61,
+  EPROTO: 71,
+  EOVERFLOW: 75,
   EOPNOTSUPP: 95,
+  ENOTSUP: 95,
+  ETIMEDOUT: 110,
+  ESTALE: 116,
+  EDQUOT: 122,
+  ECANCELED: 125,
 } as const;
 
 export type FSErrorCode = keyof typeof Errno;
+
+/**
+ * The errno to give the guest for an error a backend threw: an FSError's own;
+ * an error's by its `code` when Linux has that name; a host call's (Node's
+ * system error, with its `syscall`) whose name Linux hasn't, EIO. Anything
+ * else is no filesystem's failure (a bug, say): undefined, for its caller
+ * to throw on.
+ */
+function errno_of(error: unknown): number | undefined {
+  if (error instanceof FSError) return error.errno;
+  const { code, syscall } = (error ?? {}) as { code?: unknown; syscall?: unknown };
+  if (typeof code !== "string") return undefined;
+  if (Object.hasOwn(Errno, code)) return Errno[code as FSErrorCode];
+  return typeof syscall === "string" ? Errno.EIO : undefined;
+}
 
 /** An expected filesystem failure which should be returned to the guest. */
 export class FSError extends Error {
   readonly errno: number;
 
-  constructor(code: FSErrorCode, message: string = code) {
+  /** `code`: Linux's name for the errno, or its number. */
+  constructor(code: FSErrorCode | number, message: string = String(code)) {
     super(message);
     this.name = "FSError";
-    this.errno = Errno[code];
+    this.errno = typeof code === "number" ? code : Errno[code];
+  }
+
+  /** The FSError the device would give the guest for `error` (see errno_of), if it's a filesystem's failure. */
+  static from(error: unknown): FSError | undefined {
+    if (error instanceof FSError) return error;
+    const errno = errno_of(error);
+    return errno === undefined ? undefined : new FSError(errno, (error as Error).message);
+  }
+}
+
+/** A request's body: a malformed one (read past its end, say) is EINVAL. */
+class RequestReader extends Reader {
+  override bytes(length: number) {
+    return malformed(() => super.bytes(length));
+  }
+  override struct<T>(type: Type<T>): T {
+    return malformed(() => super.struct(type));
+  }
+  override cstring() {
+    return malformed(() => super.cstring());
+  }
+}
+
+function malformed<T>(read: () => T): T {
+  try {
+    return read();
+  } catch (error) {
+    if (error instanceof RangeError) throw new FSError("EINVAL", error.message);
+    throw error;
   }
 }
 
@@ -142,6 +252,12 @@ export interface FSAttributes {
   gid?: number;
   rdev?: number;
   blockSize?: number;
+  /**
+   * The inode number the guest sees, stable for as long as the file is
+   * (a host file's own, say). Without it, the device's id for the node,
+   * which changes when the guest forgets the node and looks it up again.
+   */
+  ino?: bigint;
 }
 
 export interface FSSetAttributes {
@@ -154,9 +270,10 @@ export interface FSSetAttributes {
   ctime?: FSTimestamp;
 }
 
-export interface FSDirectoryEntry<TNode> {
-  name: string;
+/** A name's node and its attributes, together. */
+export interface FSEntry<TNode> {
   node: TNode;
+  attributes: FSAttributes;
 }
 
 export interface FSStat {
@@ -189,7 +306,27 @@ export interface FSCreateContext {
  */
 export interface FS<TNode, THandle> {
   readonly root: TNode;
-  lookup(parent: TNode, name: string): MaybePromise<TNode | undefined>;
+  /**
+   * How long the guest may cache names and attributes, in seconds: a
+   * read-only store's can be long. Without it, the device's `cache` option.
+   */
+  readonly timeout?: number;
+  /** Keep the guest's page cache of a file across opens (FOPEN_KEEP_CACHE): for files that don't change. */
+  readonly keepCache?: boolean;
+  /**
+   * Names' nodes with their attributes, undefined for a name that isn't
+   * there (or went while listed): a lookup's one name, or a listing's names
+   * a reply at a time. (Measured, NodeFS over a 5,000-file directory, its
+   * whole READDIRPLUS: 283 ms a name at a time, the directory checked for
+   * each; 88 ms together.)
+   */
+  entries(parent: TNode, names: readonly string[]): MaybePromise<(FSEntry<TNode> | undefined)[]>;
+  /**
+   * The guest has forgotten a node: no lookup, open handle or child of it is
+   * left. A backend may drop what it keeps for the node; a later lookup of
+   * the same file may return a new node.
+   */
+  forget?(node: TNode): void;
   getattr(node: TNode, handle?: THandle): MaybePromise<FSAttributes>;
   setattr?(node: TNode, attributes: FSSetAttributes, handle?: THandle): MaybePromise<FSAttributes>;
   readlink?(node: TNode): MaybePromise<string>;
@@ -202,7 +339,18 @@ export interface FS<TNode, THandle> {
   mkdir?(parent: TNode, name: string, context: FSCreateContext): MaybePromise<TNode>;
   unlink?(parent: TNode, name: string): MaybePromise<void>;
   rmdir?(parent: TNode, name: string): MaybePromise<void>;
-  rename?(oldParent: TNode, oldName: string, newParent: TNode, newName: string): MaybePromise<void>;
+  /** `flags`: renameat2's (RENAME_NOREPLACE 1, RENAME_EXCHANGE 2, RENAME_WHITEOUT 4); 0 for rename. */
+  rename?(
+    oldParent: TNode,
+    oldName: string,
+    newParent: TNode,
+    newName: string,
+    flags: number,
+  ): MaybePromise<void>;
+  /** Another name for a node (a hard link): the node, now known by both. */
+  link?(node: TNode, newParent: TNode, newName: string): MaybePromise<TNode>;
+  /** A special or regular file; `context.mode` has its type bits, `rdev` a device's number. */
+  mknod?(parent: TNode, name: string, rdev: number, context: FSCreateContext): MaybePromise<TNode>;
   open?(node: TNode, flags: number): MaybePromise<THandle>;
   create?(
     parent: TNode,
@@ -217,14 +365,29 @@ export interface FS<TNode, THandle> {
   write?(node: TNode, handle: THandle, offset: bigint, data: Uint8Array): MaybePromise<number>;
   flush?(node: TNode, handle: THandle): MaybePromise<void>;
   fsync?(node: TNode, handle: THandle, dataOnly: boolean): MaybePromise<void>;
-  release?(node: TNode, handle: THandle): MaybePromise<void>;
-  opendir?(node: TNode, flags: number): MaybePromise<THandle>;
-  readdir?(
+  /** A directory's fsync (its entries made durable); without it, fsync with the directory's handle. */
+  fsyncdir?(node: TNode, handle: THandle, dataOnly: boolean): MaybePromise<void>;
+  /** fallocate(2)'s `mode` (FALLOC_FL_KEEP_SIZE 1, ...) on an open file. */
+  fallocate?(
     node: TNode,
     handle: THandle,
-  ): MaybePromise<Iterable<FSDirectoryEntry<TNode>> | AsyncIterable<FSDirectoryEntry<TNode>>>;
+    offset: bigint,
+    length: bigint,
+    mode: number,
+  ): MaybePromise<void>;
+  /** syncfs(2): everything written to the filesystem made durable. */
+  syncfs?(): MaybePromise<void>;
+  release?(node: TNode, handle: THandle): MaybePromise<void>;
+  opendir?(node: TNode, flags: number): MaybePromise<THandle>;
+  /**
+   * A directory's names, without "." and "..": the device looks them up
+   * (`entries`) as it lists them.
+   */
+  readdir?(node: TNode, handle: THandle): MaybePromise<Iterable<string> | AsyncIterable<string>>;
   releasedir?(node: TNode, handle: THandle): MaybePromise<void>;
   access?(node: TNode, mask: number): MaybePromise<void>;
+  /** An extended attribute's value, or undefined if the node hasn't one. */
+  getxattr?(node: TNode, name: string): MaybePromise<Uint8Array | undefined>;
   statfs?(node: TNode): MaybePromise<FSStat>;
   destroy?(): MaybePromise<void>;
 }
@@ -239,6 +402,12 @@ export interface FSDeviceOptions {
    * disable the guest data page cache and does not provide direct I/O.
    */
   cache?: boolean;
+  /**
+   * The guest's page size, in bytes (default 4096), which sizes requests:
+   * at most 252 pages each (`MAX_PAGES`), reads and writes of about 1 MiB at
+   * 4 KiB pages.
+   */
+  pageSize?: number;
 }
 
 // The FUSE request and response structs, mirroring include/uapi/linux/fuse.h.
@@ -374,6 +543,34 @@ const FuseRenameIn = Struct({
   newdir: U64LE,
 });
 
+const FuseRename2In = Struct({
+  newdir: U64LE,
+  flags: U32LE,
+  padding: U32LE,
+});
+
+const FuseLinkIn = Struct({
+  oldnodeid: U64LE,
+});
+
+const FuseMknodIn = Struct({
+  mode: U32LE,
+  rdev: U32LE,
+  umask: U32LE,
+  padding: U32LE,
+});
+
+const FuseFallocateIn = Struct({
+  fh: U64LE,
+  offset: U64LE,
+  length: U64LE,
+  mode: U32LE,
+  padding: U32LE,
+});
+
+/** renameat2's RENAME_EXCHANGE: the two names swap their files. */
+const RENAME_EXCHANGE = 1 << 1;
+
 const FuseSetattrIn = Struct({
   valid: U32LE,
   padding: U32LE,
@@ -450,6 +647,16 @@ const FuseAccessIn = Struct({
   padding: U32LE,
 });
 
+const FuseGetxattrIn = Struct({
+  size: U32LE,
+  padding: U32LE,
+});
+
+const FuseGetxattrOut = Struct({
+  size: U32LE,
+  padding: U32LE,
+});
+
 const FuseDirent = Struct({
   ino: U64LE,
   off: U64LE,
@@ -477,11 +684,17 @@ class UnsupportedOperation extends FSError {
 
 interface NodeRecord<TNode> {
   id: bigint;
+  /** The inode number its attributes last gave (FSAttributes.ino), for "." and "..". */
+  ino?: bigint;
   node: TNode;
   parent: NodeRecord<TNode>;
   lookups: bigint;
   handles: number;
   children: number;
+  /** Its open directory handles, which share its listing. */
+  directories: number;
+  /** Its names, read by a READDIR from the start and resumed by `off`, while a directory handle is open. */
+  listing?: string[];
 }
 
 interface HandleRecord<TNode, THandle> {
@@ -547,17 +760,25 @@ function concatenate(buffers: readonly VirtqueueBuffer[], writable: boolean) {
   return result;
 }
 
-function scatter(buffers: readonly VirtqueueBuffer[], data: Uint8Array) {
-  let offset = 0;
-  for (const buffer of buffers) {
-    if (!buffer.writable) continue;
-    const length = Math.min(buffer.array.byteLength, data.byteLength - offset);
-    if (length <= 0) break;
-    buffer.array.set(data.subarray(offset, offset + length));
-    offset += length;
-  }
-  if (offset !== data.byteLength) {
-    throw new Error("guest response buffers are too small");
+/** Writes `parts`, one after another, across the chain's writable buffers. */
+function scatter(buffers: readonly VirtqueueBuffer[], ...parts: Uint8Array[]) {
+  const writable = buffers.filter((buffer) => buffer.writable);
+  let index = 0;
+  let at = 0;
+  for (const data of parts) {
+    let offset = 0;
+    while (offset < data.byteLength) {
+      const buffer = writable[index];
+      if (!buffer) throw new FSError("EIO", "response exceeds the guest's response buffer");
+      const length = Math.min(buffer.array.byteLength - at, data.byteLength - offset);
+      buffer.array.set(data.subarray(offset, offset + length), at);
+      offset += length;
+      at += length;
+      if (at === buffer.array.byteLength) {
+        index += 1;
+        at = 0;
+      }
+    }
   }
 }
 
@@ -577,7 +798,9 @@ function minimum_response_capacity(opcode: number) {
       return FuseOutHeader.size + FuseInitOut.size;
     case FuseOpcode.LOOKUP:
     case FuseOpcode.SYMLINK:
+    case FuseOpcode.MKNOD:
     case FuseOpcode.MKDIR:
+    case FuseOpcode.LINK:
       return FuseOutHeader.size + FuseEntryOut.size;
     case FuseOpcode.GETATTR:
     case FuseOpcode.SETATTR:
@@ -601,12 +824,13 @@ function timestamp(value: FSTimestamp | undefined): [bigint, number] {
 }
 
 /** The `struct fuse_attr` value for a node, derived from `FSAttributes`. */
-function attr_fields(nodeid: bigint, attributes: FSAttributes) {
+function attr_fields(record: NodeRecord<unknown>, attributes: FSAttributes) {
   const [atime, atimensec] = timestamp(attributes.atime);
   const [mtime, mtimensec] = timestamp(attributes.mtime);
   const [ctime, ctimensec] = timestamp(attributes.ctime);
+  if (attributes.ino !== undefined) record.ino = attributes.ino;
   return {
-    ino: nodeid,
+    ino: attributes.ino ?? record.id,
     size: attributes.size,
     blocks: attributes.blocks ?? (attributes.size + 511n) / 512n,
     atime,
@@ -638,21 +862,21 @@ function write_entry<TNode>(
     attr_valid: validity,
     entry_valid_nsec: 0,
     attr_valid_nsec: 0,
-    attr: attr_fields(record.id, attributes),
+    attr: attr_fields(record, attributes),
   };
 }
 
 function write_attr_out(
   payload: Bytes,
   validity: bigint,
-  nodeid: bigint,
+  record: NodeRecord<unknown>,
   attributes: FSAttributes,
 ) {
   payload.alloc(FuseAttrOut).value = {
     attr_valid: validity,
     attr_valid_nsec: 0,
     dummy: 0,
-    attr: attr_fields(nodeid, attributes),
+    attr: attr_fields(record, attributes),
   };
 }
 
@@ -686,8 +910,14 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
   filesystem: T & RequiresDurability<T>,
   options: FSDeviceOptions,
 ): Device {
-  const { tag, cache = true } = options;
-  const validity = cache ? 1n : 0n;
+  const { tag, cache = true, pageSize = 4096 } = options;
+  const validity =
+    filesystem.timeout !== undefined
+      ? BigInt(Math.max(0, Math.floor(filesystem.timeout)))
+      : cache
+        ? 1n
+        : 0n;
+  const open_flags = filesystem.keepCache ? FOPEN_KEEP_CACHE : 0;
   const encoded_tag = utf8_encoder.encode(tag);
   if (encoded_tag.byteLength === 0 || encoded_tag.byteLength > 36) {
     throw new RangeError("virtio-fs tag must be between 1 and 36 UTF-8 bytes");
@@ -717,6 +947,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     lookups: 1n,
     handles: 0,
     children: 0,
+    directories: 0,
   };
   root.parent = root;
   records.set(root.id, root);
@@ -724,7 +955,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
 
   const handles = new Map<bigint, HandleRecord<TNode, THandle>>();
   let next_handle = 1n;
-  let finalize_promise: Promise<void> | undefined;
+  /** The guest's DESTROY ended its session, and no INIT has begun another. */
+  let destroyed = false;
 
   function record_for_node(node: TNode, parent: NodeRecord<TNode>) {
     let record = by_node.get(node);
@@ -736,6 +968,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         lookups: 0n,
         handles: 0,
         children: 0,
+        directories: 0,
       };
       records.set(record.id, record);
       by_node.set(node, record);
@@ -750,11 +983,22 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
       records.delete(record.id);
       by_node.delete(record.node);
       record.parent.children -= 1;
+      filesystem.forget?.(record.node);
       collect_record(record.parent);
     }
   }
 
+  // Forgets that come (on the high-priority queue) while a request is in
+  // progress wait till it's answered: it may be handing out the node they
+  // would let go of, which the backend may then drop.
+  let requests = 0;
+  const deferred: { record: NodeRecord<TNode>; count: bigint }[] = [];
+
   function forget(record: NodeRecord<TNode>, count: bigint) {
+    if (requests > 0) {
+      deferred.push({ record, count });
+      return;
+    }
     record.lookups = count >= record.lookups ? 0n : record.lookups - count;
     collect_record(record);
   }
@@ -781,88 +1025,126 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     const fh = next_handle++;
     handles.set(fh, { node, handle, directory });
     node.handles += 1;
+    if (directory) node.directories += 1;
     return fh;
   }
 
   function remove_handle(fh: bigint, handle: HandleRecord<TNode, THandle>) {
     handles.delete(fh);
     handle.node.handles -= 1;
+    if (handle.directory && --handle.node.directories === 0) handle.node.listing = undefined;
     collect_record(handle.node);
   }
 
-  function finalize() {
-    if (finalize_promise) return finalize_promise;
-    finalize_promise = (async () => {
-      let failed = false;
-      let first_error: unknown;
-      for (const [fh, handle] of handles) {
-        try {
-          if (handle.directory) {
-            await filesystem.releasedir?.(handle.node.node, handle.handle);
-          } else {
-            await filesystem.release?.(handle.node.node, handle.handle);
-          }
-        } catch (error) {
-          if (!failed) {
-            failed = true;
-            first_error = error;
-          }
-        } finally {
-          remove_handle(fh, handle);
-        }
-      }
+  /**
+   * A session's end (the guest's DESTROY, or the device's close): every
+   * handle released, every node but the root let go of (the guest sends no
+   * FORGETs as it unmounts), and the filesystem's destroy.
+   */
+  async function finalize() {
+    let failed = false;
+    let first_error: unknown;
+    for (const [fh, handle] of handles) {
       try {
-        await filesystem.destroy?.();
+        if (handle.directory) {
+          await filesystem.releasedir?.(handle.node.node, handle.handle);
+        } else {
+          await filesystem.release?.(handle.node.node, handle.handle);
+        }
       } catch (error) {
         if (!failed) {
           failed = true;
           first_error = error;
         }
+      } finally {
+        remove_handle(fh, handle);
       }
-      if (failed) throw first_error;
-    })();
-    return finalize_promise;
+    }
+    for (const record of records.values()) {
+      if (record === root) continue;
+      records.delete(record.id);
+      by_node.delete(record.node);
+    }
+    root.lookups = 1n;
+    root.children = 0;
+    try {
+      await filesystem.destroy?.();
+    } catch (error) {
+      if (!failed) {
+        failed = true;
+        first_error = error;
+      }
+    }
+    if (failed) throw first_error;
   }
 
+  /** A name's record, one more lookup of it, and its attributes. */
   async function lookup(parent: NodeRecord<TNode>, name: string) {
-    const node = await filesystem.lookup(parent.node, validate_name(name));
-    if (!node) throw new FSError("ENOENT");
-    const record = record_for_node(node, parent);
+    validate_name(name);
+    const [found] = await filesystem.entries(parent.node, [name]);
+    if (!found) throw new FSError("ENOENT");
+    const record = record_for_node(found.node, parent);
     record.lookups += 1n;
-    return record;
+    return { record, attributes: found.attributes };
+  }
+
+  /** A listing's names' entries, undefined for one gone since; or none, and the failure. */
+  async function entries_of(parent: NodeRecord<TNode>, names: readonly string[]) {
+    try {
+      return { found: await filesystem.entries(parent.node, names) };
+    } catch (failure) {
+      return { found: [], failure };
+    }
   }
 
   async function process(header: FuseInHeaderValue, body: Reader, capacity: number) {
-    const payload = new Bytes(Math.max(0, capacity - FuseOutHeader.size));
-    const node = header.nodeid === 0n ? undefined : node_record(header.nodeid);
+    // (grown as written: allocating the guest's whole response capacity, a
+    // zeroed array per request, was most of a small request's cost)
+    const payload = new Bytes();
+    // (these name no node: their nodeid is 0)
+    const unnamed: number[] = [
+      FuseOpcode.INIT,
+      FuseOpcode.BATCH_FORGET,
+      FuseOpcode.INTERRUPT,
+      FuseOpcode.DESTROY,
+    ];
+    const node = unnamed.includes(header.opcode) ? undefined : node_record(header.nodeid);
 
     switch (header.opcode) {
       case FuseOpcode.INIT: {
         const init = body.struct(FuseInitIn);
-        if (init.major !== 7) {
-          if (init.major < 7) throw new FSError("EPROTO");
+        if (init.major !== FUSE_MAJOR) {
+          if (init.major < FUSE_MAJOR) throw new FSError("EPROTO");
           // A newer kernel retries with our major; only major and minor reply.
-          payload.alloc(U32LE).value = 7;
-          payload.alloc(U32LE).value = 45;
+          payload.alloc(U32LE).value = FUSE_MAJOR;
+          payload.alloc(U32LE).value = FUSE_MINOR;
           break;
         }
+        // Older minors lack replies this device's structs assume.
+        if (init.minor < FUSE_MINIMUM_MINOR) throw new FSError("EPROTO");
+        destroyed = false;
         const supported_flags =
           FuseInitFlags.ASYNC_READ |
+          FuseInitFlags.ATOMIC_O_TRUNC |
           FuseInitFlags.BIG_WRITES |
           FuseInitFlags.AUTO_INVAL_DATA |
+          FuseInitFlags.DO_READDIRPLUS |
+          FuseInitFlags.READDIRPLUS_AUTO |
+          FuseInitFlags.PARALLEL_DIROPS |
           FuseInitFlags.MAX_PAGES |
+          FuseInitFlags.CACHE_SYMLINKS |
           FuseInitFlags.INIT_EXT;
         const flags = init.flags & supported_flags;
         payload.alloc(FuseInitOut).value = {
-          major: 7,
-          minor: Math.min(init.minor, 45),
+          major: FUSE_MAJOR,
+          minor: Math.min(init.minor, FUSE_MINOR),
           max_readahead: Math.min(init.max_readahead, 1024 * 1024),
           flags,
           max_background: 12,
           congestion_threshold: 9,
-          max_write: 1024 * 1024,
+          max_write: MAX_PAGES * pageSize,
           time_gran: 1,
-          max_pages: (flags & FuseInitFlags.MAX_PAGES) === 0 ? 0 : 16,
+          max_pages: (flags & FuseInitFlags.MAX_PAGES) === 0 ? 0 : MAX_PAGES,
           map_alignment: 0,
           flags2: 0,
           max_stack_depth: 0,
@@ -872,8 +1154,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         break;
       }
       case FuseOpcode.LOOKUP: {
-        const record = await lookup(node!, body.cstring());
-        write_entry(payload, record, await filesystem.getattr(record.node), validity);
+        const { record, attributes } = await lookup(node!, body.cstring());
+        write_entry(payload, record, attributes, validity);
         break;
       }
       case FuseOpcode.FORGET: {
@@ -898,7 +1180,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           request.getattr_flags & FuseGetattrFlags.FH
             ? handle_record(request.fh, undefined, node!).handle
             : undefined;
-        write_attr_out(payload, validity, node!.id, await filesystem.getattr(node!.node, handle));
+        write_attr_out(payload, validity, node!, await filesystem.getattr(node!.node, handle));
         break;
       }
       case FuseOpcode.SETATTR: {
@@ -929,7 +1211,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
             ? handle_record(request.fh, undefined, node!).handle
             : undefined;
         const attributes = await filesystem.setattr(node!.node, changes, open);
-        write_attr_out(payload, validity, node!.id, attributes);
+        write_attr_out(payload, validity, node!, attributes);
         break;
       }
       case FuseOpcode.READLINK: {
@@ -972,27 +1254,67 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         await method.call(filesystem, node!.node, validate_name(body.cstring()));
         break;
       }
-      case FuseOpcode.RENAME: {
+      case FuseOpcode.RENAME:
+      case FuseOpcode.RENAME2: {
         if (!filesystem.rename) throw new UnsupportedOperation();
-        const request = body.struct(FuseRenameIn);
-        const new_parent = node_record(request.newdir);
+        const { newdir, flags } =
+          header.opcode === FuseOpcode.RENAME2
+            ? body.struct(FuseRename2In)
+            : { newdir: body.struct(FuseRenameIn).newdir, flags: 0 };
+        const new_parent = node_record(newdir);
         const old_name = validate_name(body.cstring());
         const new_name = validate_name(body.cstring());
-        const moved =
-          node === new_parent ? undefined : await filesystem.lookup(node!.node, old_name);
-        const moved_record = moved && by_node.get(moved);
-        await filesystem.rename(node!.node, old_name, new_parent.node, new_name);
-        if (
-          moved_record &&
-          records.get(moved_record.id) === moved_record &&
-          moved_record.parent !== new_parent
-        ) {
-          const old_parent = moved_record.parent;
-          old_parent.children -= 1;
-          moved_record.parent = new_parent;
-          new_parent.children += 1;
-          collect_record(old_parent);
-        }
+        const known = async (parent: NodeRecord<TNode>, name: string) => {
+          if (node === new_parent) return undefined;
+          const found = (await filesystem.entries(parent.node, [name]))[0]?.node;
+          if (!found) return undefined;
+          const record = by_node.get(found);
+          // (a node the guest doesn't know: the backend may let it go)
+          if (!record) filesystem.forget?.(found);
+          return record;
+        };
+        const moved = await known(node!, old_name);
+        // An exchange moves the other file the other way.
+        const swapped = flags & RENAME_EXCHANGE ? await known(new_parent, new_name) : undefined;
+        await filesystem.rename(node!.node, old_name, new_parent.node, new_name, flags);
+        const reparent = (record: NodeRecord<TNode> | undefined, to: NodeRecord<TNode>) => {
+          if (!record || records.get(record.id) !== record || record.parent === to) return;
+          const from = record.parent;
+          from.children -= 1;
+          record.parent = to;
+          to.children += 1;
+          collect_record(from);
+        };
+        reparent(moved, new_parent);
+        reparent(swapped, node!);
+        break;
+      }
+      case FuseOpcode.LINK: {
+        if (!filesystem.link) throw new UnsupportedOperation();
+        const request = body.struct(FuseLinkIn);
+        const target = node_record(request.oldnodeid);
+        const linked = await filesystem.link(
+          target.node,
+          node!.node,
+          validate_name(body.cstring()),
+        );
+        const record = record_for_node(linked, node!);
+        record.lookups += 1n;
+        write_entry(payload, record, await filesystem.getattr(linked), validity);
+        break;
+      }
+      case FuseOpcode.MKNOD: {
+        if (!filesystem.mknod) throw new UnsupportedOperation();
+        const request = body.struct(FuseMknodIn);
+        const made = await filesystem.mknod(
+          node!.node,
+          validate_name(body.cstring()),
+          request.rdev,
+          create_context(header, request.mode, request.umask & 0o777),
+        );
+        const record = record_for_node(made, node!);
+        record.lookups += 1n;
+        write_entry(payload, record, await filesystem.getattr(made), validity);
         break;
       }
       case FuseOpcode.OPEN:
@@ -1004,10 +1326,11 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         const handle = await method.call(filesystem, node!.node, request.flags);
         payload.alloc(FuseOpenOut).value = {
           fh: add_handle(node!, handle, directory),
-          // Keep open flags zero even when cache is false. Cache controls only
-          // entry/attribute validity; FOPEN_DIRECT_IO would route private
+          // Never FOPEN_DIRECT_IO, even when cache is false: cache controls
+          // only entry/attribute validity, and direct I/O would route private
           // owner-worker user buffers through unsupported page extraction.
-          open_flags: 0,
+          // A backend's unchanging files keep their page cache.
+          open_flags: directory ? 0 : open_flags,
           backing_id: -1,
         };
         break;
@@ -1029,7 +1352,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           // CREATE returns the same open flags as OPEN; direct I/O is
           // unsupported by this wasm transport even when metadata/name
           // validity is zero.
-          open_flags: 0,
+          open_flags,
           backing_id: -1,
         };
         break;
@@ -1047,8 +1370,8 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         if (data.byteLength > request.size || data.byteLength > capacity - FuseOutHeader.size) {
           throw new FSError("EIO", "filesystem returned too much data");
         }
-        payload.append(data);
-        break;
+        // The data itself is the reply's payload, written to the guest as is.
+        return data;
       }
       case FuseOpcode.WRITE: {
         if (!filesystem.write) throw new UnsupportedOperation();
@@ -1078,10 +1401,32 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
       case FuseOpcode.FSYNC:
       case FuseOpcode.FSYNCDIR: {
         const request = body.struct(FuseFsyncIn);
-        const handle = handle_record(request.fh, header.opcode === FuseOpcode.FSYNCDIR, node!);
-        if (filesystem.fsync) {
-          await filesystem.fsync(handle.node.node, handle.handle, (request.fsync_flags & 1) !== 0);
+        const directory = header.opcode === FuseOpcode.FSYNCDIR;
+        const handle = handle_record(request.fh, directory, node!);
+        const data_only = (request.fsync_flags & 1) !== 0;
+        if (directory && filesystem.fsyncdir) {
+          await filesystem.fsyncdir(handle.node.node, handle.handle, data_only);
+        } else if (filesystem.fsync) {
+          await filesystem.fsync(handle.node.node, handle.handle, data_only);
         }
+        break;
+      }
+      case FuseOpcode.FALLOCATE: {
+        if (!filesystem.fallocate) throw new UnsupportedOperation();
+        const request = body.struct(FuseFallocateIn);
+        const handle = handle_record(request.fh, false, node!);
+        await filesystem.fallocate(
+          handle.node.node,
+          handle.handle,
+          request.offset,
+          request.length,
+          request.mode,
+        );
+        break;
+      }
+      case FuseOpcode.SYNCFS: {
+        if (!filesystem.syncfs) throw new UnsupportedOperation();
+        await filesystem.syncfs();
         break;
       }
       case FuseOpcode.RELEASE:
@@ -1097,50 +1442,83 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         remove_handle(request.fh, handle);
         break;
       }
-      case FuseOpcode.READDIR: {
+      case FuseOpcode.READDIR:
+      case FuseOpcode.READDIRPLUS: {
         if (!filesystem.readdir) throw new UnsupportedOperation();
+        // READDIRPLUS: each entry with its node and attributes, as a lookup
+        // would give them, and counted as one by the guest.
+        const plus = header.opcode === FuseOpcode.READDIRPLUS;
         const request = body.struct(FuseReadIn);
         const offset = checked_number(request.offset);
         const handle = handle_record(request.fh, true, node!);
-        // The guest resumes readdir by `off`, which is an index into the
-        // entry array we rebuild here: the caller's directory plus the "." and
-        // ".." entries this device injects. Each request re-reads the whole
-        // directory and skips `off` entries, so no directory position state is
-        // kept between requests.
-        const entries = [
-          { name: ".", record: handle.node },
-          { name: "..", record: handle.node.parent },
-        ];
-        const directory_entries = await filesystem.readdir(handle.node.node, handle.handle);
-        const transient: NodeRecord<TNode>[] = [];
+        const directory = handle.node;
+        // The guest resumes readdir by `off`, an index into the directory's
+        // names after the "." and ".." this device injects. The names are
+        // read by a READDIR from the start and shared by the directory's
+        // handles till the last closes: one listing a directory, whatever
+        // its handles; each name is looked up as it's listed.
+        if (!directory.listing || offset === 0) {
+          const names: string[] = [];
+          const listing = await filesystem.readdir(directory.node, handle.handle);
+          for (const name of await async_iterable(listing)) names.push(validate_name(name));
+          directory.listing = names;
+        }
+        const names = directory.listing;
+        const name_at = (index: number) =>
+          index === 0 ? "." : index === 1 ? ".." : names[index - 2]!;
+        // FUSE dirents are padded to 8 bytes: 24-byte header + name, after
+        // READDIRPLUS's entry. The names that fit are looked up together.
+        const record_length = (encoded: Uint8Array) =>
+          ((plus ? FuseEntryOut.size : 0) + 24 + encoded.byteLength + 7) & ~7;
         const limit = Math.min(request.size, capacity - FuseOutHeader.size);
-        try {
-          for (const entry of await async_iterable(directory_entries)) {
-            const record = record_for_node(entry.node, handle.node);
-            transient.push(record);
-            entries.push({
-              name: validate_name(entry.name),
-              record,
-            });
+        let end = offset;
+        for (let used = 0; end < names.length + 2; end++) {
+          used += record_length(utf8_encoder.encode(name_at(end)));
+          if (used > limit) break;
+        }
+        const first = Math.max(offset, 2);
+        const { found, failure } =
+          end > first
+            ? await entries_of(directory, names.slice(first - 2, end - 2))
+            : { found: [] };
+        for (let index = offset; index < end; index++) {
+          const encoded = utf8_encoder.encode(name_at(index));
+          let ino: bigint;
+          let mode: number;
+          if (index < 2) {
+            // "." and "..": no entry (nodeid 0), as the guest takes them so.
+            const record = index === 0 ? directory : directory.parent;
+            if (plus) payload.bump(FuseEntryOut.size);
+            ino = record.ino ?? record.id;
+            mode = FileType.directory;
+          } else {
+            // Gone since the listing: left out. A failure ends the reply
+            // with what it has (whose lookups count), failing only an empty
+            // one, as virtiofsd's.
+            if (index - first >= found.length) {
+              if (payload.length > 0 && errno_of(failure) !== undefined) break;
+              throw failure;
+            }
+            const entry = found[index - first];
+            if (!entry) continue;
+            const record = record_for_node(entry.node, directory);
+            if (plus) {
+              record.lookups += 1n;
+              write_entry(payload, record, entry.attributes, validity);
+            }
+            ino = entry.attributes.ino ?? record.ino ?? record.id;
+            mode = entry.attributes.mode;
+            // (a READDIR's entry isn't a lookup the guest keeps)
+            if (!plus) collect_record(record);
           }
-          for (let index = offset; index < entries.length; index++) {
-            const entry = entries[index]!;
-            const name = utf8_encoder.encode(entry.name);
-            // FUSE dirents are padded to 8 bytes: 24-byte header + name.
-            const record_length = (24 + name.byteLength + 7) & ~7;
-            if (payload.length + record_length > limit) break;
-            const attributes = await filesystem.getattr(entry.record.node);
-            payload.alloc(FuseDirent).value = {
-              ino: entry.record.id,
-              off: BigInt(index + 1),
-              namelen: name.byteLength,
-              type: DirentType[mode_type(attributes.mode)],
-            };
-            payload.append(name);
-            payload.bump(-payload.length & 7);
-          }
-        } finally {
-          for (const record of transient) collect_record(record);
+          payload.alloc(FuseDirent).value = {
+            ino,
+            off: BigInt(index + 1),
+            namelen: encoded.byteLength,
+            type: DirentType[mode_type(mode)],
+          };
+          payload.append(encoded);
+          payload.bump(-payload.length & 7);
         }
         break;
       }
@@ -1165,21 +1543,41 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         if (filesystem.access) await filesystem.access(node!.node, request.mask);
         break;
       }
+      case FuseOpcode.GETXATTR: {
+        if (!filesystem.getxattr) throw new UnsupportedOperation();
+        const request = body.struct(FuseGetxattrIn);
+        const value = await filesystem.getxattr(node!.node, body.cstring());
+        if (!value) throw new FSError("ENODATA");
+        // A size of 0 asks only how long the value is.
+        if (!request.size) {
+          payload.alloc(FuseGetxattrOut).value = { size: value.byteLength, padding: 0 };
+          break;
+        }
+        if (value.byteLength > request.size) throw new FSError("ERANGE");
+        return value;
+      }
       case FuseOpcode.INTERRUPT:
         return undefined;
       case FuseOpcode.DESTROY:
+        destroyed = true;
         await finalize();
         break;
       default:
         throw new UnsupportedOperation();
     }
-    if (payload.length > capacity - FuseOutHeader.size) {
-      throw new FSError("EIO", "response exceeds the guest's response buffer");
-    }
-    return payload;
+    return payload.array;
   }
 
-  async function notify(queue: Virtqueue) {
+  /**
+   * A queue's requests, one after another, in order: the device delivers a
+   * queue's kicks one at a time (`VirtioDevice.kick`), and each request here
+   * is answered before the next is read. So the filesystem sees one request
+   * of a queue at a time. The high-priority queue carries only FORGETs,
+   * which reach the filesystem as `forget`, synchronously, or once a
+   * request in progress is answered (`forget`, above). Each request's
+   * work is the host's (`host_work`) until its reply is written.
+   */
+  async function notify(queue: Virtqueue, host_work: <R>(work: Promise<R>) => Promise<R>) {
     for (const chain of queue) {
       const buffers = [...chain];
       const request = concatenate(buffers, false);
@@ -1195,7 +1593,7 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
           }
           saw_writable ||= buffer.writable;
         }
-        const body = new Reader(request);
+        const body = new RequestReader(request);
         const header = body.struct(FuseInHeader);
         unique = header.unique;
         if (header.len !== request.byteLength || header.len < FuseInHeader.size) {
@@ -1204,34 +1602,41 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
         if (capacity < minimum_response_capacity(header.opcode)) {
           throw new FSError("EINVAL", "FUSE response buffer is too small");
         }
-        const payload = await process(header, body, capacity);
+        const forgets =
+          header.opcode === FuseOpcode.FORGET || header.opcode === FuseOpcode.BATCH_FORGET;
+        if (!forgets) requests += 1;
+        let payload: Uint8Array | undefined;
+        try {
+          payload = await host_work(process(header, body, capacity));
+        } finally {
+          if (!forgets && --requests === 0) {
+            for (const { record, count } of deferred.splice(0)) forget(record, count);
+          }
+        }
         if (payload === undefined) {
           chain.release(0);
           continue;
         }
-        const response = new Bytes(FuseOutHeader.size + payload.length);
+        const response = new Bytes(FuseOutHeader.size);
         response.alloc(FuseOutHeader).value = {
-          len: FuseOutHeader.size + payload.length,
+          len: FuseOutHeader.size + payload.byteLength,
           error: 0,
           unique,
         };
-        response.append(payload.array);
-        scatter(buffers, response.array);
-        chain.release(response.array.byteLength);
+        // The header and payload go to the guest's buffers as they are,
+        // without first being joined into one response.
+        scatter(buffers, response.array, payload);
+        chain.release(FuseOutHeader.size + payload.byteLength);
       } catch (error) {
+        // What the guest can cause, its errno; anything else is the host's
+        // to report (it fails the machine).
+        const errno = errno_of(error);
+        if (errno === undefined) throw error;
         if (capacity < FuseOutHeader.size) {
           chain.release(0);
           continue;
         }
         const response = new Bytes(FuseOutHeader.size);
-        // Malformed requests are EINVAL; RangeError comes from the Reader
-        // bounds checks and is the same class of protocol error.
-        const errno =
-          error instanceof FSError
-            ? error.errno
-            : error instanceof RangeError
-              ? Errno.EINVAL
-              : Errno.EIO;
         response.alloc(FuseOutHeader).value = {
           len: FuseOutHeader.size,
           error: -errno,
@@ -1243,26 +1648,35 @@ export function fileSystemDevice<TNode extends object, THandle, T extends FS<TNo
     }
   }
 
-  return public_handle(new FileSystemDevice(config, notify, finalize), {});
+  // (closed after a DESTROY: that session is already ended)
+  const close = async () => {
+    if (!destroyed) await finalize();
+  };
+  return public_handle(new FileSystemDevice(config, notify, close), {});
 }
 
 class FileSystemDevice extends VirtioDevice {
-  readonly #notify: (queue: Virtqueue) => Promise<void>;
+  readonly #notify: (
+    queue: Virtqueue,
+    host_work: <R>(work: Promise<R>) => Promise<R>,
+  ) => Promise<void>;
   readonly #finalize: () => Promise<void>;
 
   constructor(
     config: Uint8Array,
-    notify: (queue: Virtqueue) => Promise<void>,
+    notify: (queue: Virtqueue, host_work: <R>(work: Promise<R>) => Promise<R>) => Promise<void>,
     finalize: () => Promise<void>,
   ) {
     // 26 is the virtio-fs device ID: a high-priority queue and one request queue.
-    super({ id: 26, queues: 2, config });
+    // Views: requests are read and replies written in guest memory itself,
+    // not in copies written back at release. Reset waits for kicks in flight.
+    super({ id: 26, queues: 2, config, views: true });
     this.#notify = notify;
     this.#finalize = finalize;
   }
 
   protected kick(_vq: number, queue: Virtqueue) {
-    return this.#notify(queue);
+    return this.#notify(queue, (work) => this.host_work(work));
   }
 
   protected close() {

@@ -62,6 +62,7 @@ export function attach_devices({
   devices: readonly Device[];
   trigger_irq: (irq: number) => void;
   on_error: (error: unknown) => void;
+  host_work?: <T>(work: Promise<T>) => Promise<T>;
 }) {
   return new VirtioBus(devices).attach(context);
 }
